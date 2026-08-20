@@ -1,0 +1,27 @@
+[package]
+name = "text3d"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+wgpu = "30.0"
+winit = "0.30"
+ttf-parser = "0.25"
+lyon_tessellation = "1.0"
+glam = "0.33"
+bytemuck = { version = "1", features = ["derive"] }
+pollster = "1.0"
+tree-sitter = "0.26"
+tree-sitter-rust = "0.24"
+tree-sitter-c-sharp = "0.23"
+nucleo-matcher = "0.3"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
