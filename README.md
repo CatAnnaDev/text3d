@@ -16,6 +16,6 @@
 | cmd + début / fin | haut ou bas du document |
 
 ## Aperçus
-![video](media/demo.mp4)
+![video](media/demo.gif)
 ![relief](media/apercu-relief.png)
 ![complétion](media/apercu-completion.png)
