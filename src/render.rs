@@ -43,7 +43,7 @@ const SHADOW_CONTACT: f32 = 0.55;
 const GLYPH_HALF_DEPTH: f32 = 0.13;
 const CURRENT_LINE_LIFT: f32 = 0.34;
 const WAVE_AMPLITUDE: f32 = 0.014;
-const INDENT_DEPTH: f32 = 0.09;
+pub const INDENT_DEPTH: f32 = 0.09;
 const MAX_INDENT_LEVEL: usize = 8;
 
 const LOD_UNSET: u8 = u8::MAX;
@@ -2583,7 +2583,7 @@ fn pick_lod(distance: f32, previous: u8) -> u8 {
     }
 }
 
-fn indent_level(line: &str) -> usize {
+pub fn indent_level(line: &str) -> usize {
     let mut columns = 0usize;
     for byte in line.as_bytes() {
         match byte {

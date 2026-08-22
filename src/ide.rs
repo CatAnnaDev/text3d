@@ -521,7 +521,9 @@ impl Ide {
                 }
             }
         };
-        self.cancel_intent(slot, Intent::WorkspaceSymbols);
+        for other in 0..self.sessions.len() {
+            self.cancel_intent(other, Intent::WorkspaceSymbols);
+        }
         let Some(server) = self.sessions[slot].server.as_mut() else {
             return;
         };
@@ -550,6 +552,7 @@ impl Ide {
         if edits.iter().all(|(_, list)| list.is_empty()) {
             return Ok((0, 0));
         }
+        let origin = self.workspace.active();
         let mut targets: Vec<usize> = Vec::with_capacity(edits.len());
         for (path, list) in edits {
             if list.is_empty() {
@@ -561,7 +564,6 @@ impl Ide {
                 Err(error) => return Err(format!("{}: {error}", path.display())),
             }
         }
-        let origin = self.workspace.active();
         let mut order: Vec<(u32, u32)> = Vec::new();
         let mut seen: Vec<usize> = Vec::new();
         let mut files = 0usize;

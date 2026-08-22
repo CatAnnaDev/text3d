@@ -46,7 +46,6 @@ use font::Font;
 use hud::{Hud, HudModel, Region, Target};
 use ide::{Ide, Notice};
 use layout::LineLayout;
-use lsp::position::utf16_to_char;
 use lsp::protocol::{Severity, SignatureInfo, Symbol};
 use overlay::{Overlay, Panel, Row, RowKind, VISIBLE_ROWS};
 use project::Project;
@@ -378,6 +377,12 @@ impl App {
         self.completion.dismiss();
         if let Some(path) = self.ide.workspace().buffer().path.clone() {
             self.ide.project_mut().expand_to(&path);
+            let entries = self.ide.project().entries();
+            if let Some(index) = entries.iter().position(|entry| entry.path == path) {
+                let total = entries.len();
+                self.overlay.set_sidebar_selection(index);
+                self.overlay.reveal_tree(index, total);
+            }
         }
     }
 
@@ -578,7 +583,13 @@ impl App {
 
     fn pick_at(&mut self, x: f32, y: f32) -> Option<pick::Hit> {
         let App { renderer, camera, viewport, ide, font, pick_layout, .. } = self;
-        let aspect = renderer.as_ref()?.aspect();
+        let renderer = renderer.as_ref()?;
+        let aspect = renderer.aspect();
+        let indent_depth = if renderer.depth_by_indent() {
+            render::INDENT_DEPTH
+        } else {
+            0.0
+        };
         pick::hit_text(
             camera,
             aspect,
@@ -589,6 +600,7 @@ impl App {
             ide.workspace().buffer(),
             font,
             pick_layout,
+            indent_depth,
         )
     }
 
@@ -743,7 +755,7 @@ impl App {
             }
             Some(Region::Output) => {
                 let total = self.ide.tasks().lines().len();
-                self.overlay.scroll_output(-steps, total);
+                self.overlay.scroll_output(steps, total);
             }
             Some(Region::Panel) => self.overlay.move_selection(steps),
             None => {
@@ -820,7 +832,7 @@ impl App {
             self.ide.project().root().join(path)
         };
         let cursor = Cursor { line: row.saturating_sub(1), column: column.saturating_sub(1) };
-        self.jump_to(&full, cursor, false);
+        self.jump_to(&full, cursor);
     }
 
     fn open_path(&mut self, path: &Path, cursor: Option<Cursor>) {
@@ -831,30 +843,9 @@ impl App {
         }
     }
 
-    fn jump_to(&mut self, path: &Path, cursor: Cursor, utf16: bool) {
+    fn jump_to(&mut self, path: &Path, cursor: Cursor) {
         self.ide.workspace_mut().push_jump();
-        let seed = Cursor {
-            line: cursor.line,
-            column: if utf16 { 0 } else { cursor.column },
-        };
-        self.open_path(path, Some(seed));
-        if !utf16 {
-            return;
-        }
-        let column = {
-            let buffer = self.ide.workspace().buffer();
-            let line = buffer
-                .lines
-                .get(cursor.line)
-                .map(String::as_str)
-                .unwrap_or("");
-            utf16_to_char(line, cursor.column as u32)
-        };
-        self.ide
-            .workspace_mut()
-            .buffer_mut()
-            .set_cursor(Cursor { line: cursor.line, column }, false);
-        self.refresh_view();
+        self.open_path(path, Some(cursor));
     }
 
     fn select_everything(&mut self) {
@@ -1380,12 +1371,12 @@ impl App {
     }
 
     fn sync_finder(&mut self, force: bool) {
-        let (count, scanning) = self.ide.project().indexed();
+        let (count, done) = self.ide.project().indexed();
         if !force {
             if count == self.indexed {
                 return;
             }
-            if scanning && self.finder_at.elapsed() < FINDER_REFRESH {
+            if !done && self.finder_at.elapsed() < FINDER_REFRESH {
                 return;
             }
         }
@@ -1497,7 +1488,7 @@ impl App {
 
     fn rows_hits(&mut self) {
         let App { ide, overlay, .. } = self;
-        let mut rows = overlay.take_rows();
+        let mut rows = overlay.recycle_rows();
         rows.clear();
         let search = ide.search();
         let hits = search.hits();
@@ -1537,7 +1528,7 @@ impl App {
     fn rows_problems(&mut self) {
         let App { ide, overlay, .. } = self;
         let needle = overlay.query().to_ascii_lowercase();
-        let mut rows = overlay.take_rows();
+        let mut rows = overlay.recycle_rows();
         rows.clear();
         let all = ide.all_diagnostics();
         rows.reserve(all.len().min(PANEL_LIMIT));
@@ -1662,7 +1653,7 @@ impl App {
             return;
         };
         self.close_panel();
-        self.jump_to(&path, cursor, picked.utf16);
+        self.jump_to(&path, cursor);
     }
 
     fn open_project_dialog(&mut self) {
@@ -1882,7 +1873,7 @@ impl App {
                         line: location.range.start.line as usize,
                         column: location.range.start.character as usize,
                     };
-                    self.jump_to(&path, cursor, true);
+                    self.jump_to(&path, cursor);
                 }
                 _ => {
                     self.symbols.clear();
@@ -2631,7 +2622,6 @@ impl App {
 struct PickedRow {
     label: String,
     command: bool,
-    utf16: bool,
     target: Option<(PathBuf, Cursor)>,
 }
 
@@ -2639,7 +2629,6 @@ fn describe_row(row: &Row) -> PickedRow {
     PickedRow {
         label: row.label.clone(),
         command: matches!(row.kind, RowKind::Command),
-        utf16: matches!(row.kind, RowKind::Symbol | RowKind::Reference),
         target: row.target.clone(),
     }
 }

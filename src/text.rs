@@ -161,8 +161,7 @@ impl TextBuffer {
             Some(path) => path.clone(),
             None => PathBuf::from("untitled.txt"),
         };
-        let mut out = self.lines.join("\n");
-        out.push('\n');
+        let out = self.lines.join("\n");
         match std::fs::write(&path, out) {
             Ok(()) => {
                 self.modified = false;

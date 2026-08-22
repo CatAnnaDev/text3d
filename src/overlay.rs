@@ -302,6 +302,10 @@ impl Overlay {
         self.reveal();
     }
 
+    pub fn recycle_rows(&mut self) -> Vec<Row> {
+        std::mem::take(&mut self.rows)
+    }
+
     pub fn take_rows(&mut self) -> Vec<Row> {
         let rows = std::mem::take(&mut self.rows);
         self.selection = 0;
