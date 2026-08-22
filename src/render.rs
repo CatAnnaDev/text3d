@@ -1,17 +1,19 @@
+use std::fmt::Write as _;
 use std::ops::Range;
 use std::sync::Arc;
 
 use bytemuck::{Pod, Zeroable};
-use glam::Vec3;
+use glam::{Mat4, Vec3};
 use winit::window::Window;
 
-use crate::atlas::{BLANK, GlyphAtlas};
+use crate::atlas::{BLANK, GlyphAtlas, LOD_FAR, LOD_MID, LOD_NEAR, Slot};
 use crate::camera::Camera;
 use crate::complete::{Completion, VISIBLE_ROWS};
 use crate::extrude::Vertex;
 use crate::font::Font;
+use crate::layout::LineLayout;
 use crate::syntax::{Highlighter, STYLE_COLORS, STYLE_TEXT};
-use crate::text::TextBuffer;
+use crate::text::{Match, TAB_WIDTH, TextBuffer};
 
 pub const VISIBLE_RADIUS: usize = 160;
 
@@ -29,10 +31,45 @@ const PANEL_SELECTED: [u8; 4] = [58, 96, 140, 235];
 const TAG_COLOR: [u8; 4] = [110, 122, 150, 255];
 const TAG_COLUMNS: f32 = 4.4;
 
+const SHADOW_SIZE: u32 = 2048;
+const SHADOW_MARGIN: f32 = 0.5;
+const SHADOW_QUANTUM: f32 = 4.0;
+const SHADOW_CONTACT: f32 = 0.55;
+
+const GLYPH_HALF_DEPTH: f32 = 0.13;
+const CURRENT_LINE_LIFT: f32 = 0.34;
+const WAVE_AMPLITUDE: f32 = 0.014;
+const INDENT_DEPTH: f32 = 0.09;
+const MAX_INDENT_LEVEL: usize = 8;
+
+const LOD_UNSET: u8 = u8::MAX;
+const LOD_NEAR_LIMIT: f32 = 26.0;
+const LOD_FAR_LIMIT: f32 = 70.0;
+const LOD_HYSTERESIS: f32 = 0.15;
+
+const HIGHLIGHT_Z: f32 = -0.02;
+const SELECTION_COLOR: [u8; 4] = [62, 92, 148, 190];
+const MATCH_COLOR: [u8; 4] = [132, 108, 40, 190];
+const CURRENT_MATCH_COLOR: [u8; 4] = [196, 150, 52, 220];
+const CURSOR_COLOR: [u8; 4] = [255, 194, 102, 255];
+
+const FIND_PLANE: f32 = 0.82;
+const FIND_TEXT_FRACTION: f32 = 0.042;
+const FIND_PAD: f32 = 0.42;
+const FIND_GAP: f32 = 1.4;
+const FIND_LABEL_COLOR: [u8; 4] = [138, 156, 190, 255];
+const FIND_VALUE_COLOR: [u8; 4] = [226, 234, 248, 255];
+const FIND_COUNT_COLOR: [u8; 4] = [196, 150, 52, 255];
+const FIND_CARET_WIDTH: f32 = 0.07;
+
+const INSTANCE_SIZE: u64 = std::mem::size_of::<Instance>() as u64;
+const PANEL_VERTEX_SIZE: u64 = std::mem::size_of::<PanelVertex>() as u64;
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct Globals {
     view_proj: [[f32; 4]; 4],
+    light_view_proj: [[f32; 4]; 4],
     camera_pos: [f32; 4],
     light_dir: [f32; 4],
     fog: [f32; 4],
@@ -43,13 +80,26 @@ struct Globals {
     highlight: [f32; 4],
     ground: [f32; 4],
     params: [f32; 4],
+    shadow: [f32; 4],
+    find_anchor: [f32; 4],
+    find_right: [f32; 4],
+    find_up: [f32; 4],
 }
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct Instance {
     offset: [f32; 3],
+    scale: [f32; 2],
     color: [u8; 4],
+}
+
+impl Instance {
+    const ZERO: Instance = Instance {
+        offset: [0.0; 3],
+        scale: [0.0; 2],
+        color: [0; 4],
+    };
 }
 
 #[repr(C)]
@@ -59,6 +109,36 @@ struct PanelVertex {
     color: [u8; 4],
 }
 
+pub struct FindBarView<'a> {
+    pub query: &'a str,
+    pub replacement: &'a str,
+    pub replacing: bool,
+    pub current: Option<usize>,
+    pub total: usize,
+}
+
+pub struct RenderStats {
+    pub instances: u32,
+    pub triangles: u32,
+    pub atlas_bytes: usize,
+    pub draws: u32,
+}
+
+pub struct MeshGroup {
+    pub color: [u8; 4],
+    pub start: u32,
+    pub count: u32,
+}
+
+#[derive(Default)]
+pub struct SceneMesh {
+    pub vertices: Vec<[f32; 3]>,
+    pub normals: Vec<[f32; 3]>,
+    pub indices: Vec<u32>,
+    pub colors: Vec<[u8; 4]>,
+    pub groups: Vec<MeshGroup>,
+}
+
 struct InstanceSet {
     values: Vec<Instance>,
     offsets: Vec<u32>,
@@ -66,10 +146,13 @@ struct InstanceSet {
     cursors: Vec<u32>,
     buffer: wgpu::Buffer,
     capacity: u32,
+    draws: u32,
+    triangles: u32,
+    label: &'static str,
 }
 
 impl InstanceSet {
-    fn new(device: &wgpu::Device, label: &str) -> InstanceSet {
+    fn new(device: &wgpu::Device, label: &'static str) -> InstanceSet {
         InstanceSet {
             values: Vec::new(),
             offsets: Vec::new(),
@@ -77,15 +160,27 @@ impl InstanceSet {
             cursors: Vec::new(),
             buffer: device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(label),
-                size: 1024,
+                size: INSTANCE_SIZE * 64,
                 usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             }),
             capacity: 64,
+            draws: 0,
+            triangles: 0,
+            label,
         }
     }
 
-    fn group(&mut self, slot_count: usize) {
+    fn discard(&mut self) {
+        self.scratch.clear();
+        self.values.clear();
+        self.offsets.clear();
+        self.draws = 0;
+        self.triangles = 0;
+    }
+
+    fn group(&mut self, slots: &[Slot]) {
+        let slot_count = slots.len();
         self.offsets.clear();
         self.offsets.resize(slot_count + 1, 0);
         for (slot, _) in &self.scratch {
@@ -96,8 +191,7 @@ impl InstanceSet {
         }
 
         self.values.clear();
-        self.values
-            .resize(self.scratch.len(), Instance { offset: [0.0; 3], color: [0; 4] });
+        self.values.resize(self.scratch.len(), Instance::ZERO);
         self.cursors.clear();
         self.cursors.extend_from_slice(&self.offsets);
         for (slot, instance) in &self.scratch {
@@ -105,9 +199,20 @@ impl InstanceSet {
             self.values[*at as usize] = *instance;
             *at += 1;
         }
+
+        self.draws = 0;
+        self.triangles = 0;
+        for (index, slot) in slots.iter().enumerate() {
+            let count = self.offsets[index + 1] - self.offsets[index];
+            if count == 0 {
+                continue;
+            }
+            self.draws += 1;
+            self.triangles += count * (slot.index_count / 3);
+        }
     }
 
-    fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, label: &str) {
+    fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
         if self.values.is_empty() {
             return;
         }
@@ -115,14 +220,136 @@ impl InstanceSet {
         if needed > self.capacity {
             self.capacity = needed.next_power_of_two();
             self.buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(label),
-                size: u64::from(self.capacity) * 16,
+                label: Some(self.label),
+                size: u64::from(self.capacity) * INSTANCE_SIZE,
                 usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
         }
         queue.write_buffer(&self.buffer, 0, bytemuck::cast_slice(&self.values));
     }
+}
+
+struct FlatInstances {
+    values: Vec<Instance>,
+    buffer: wgpu::Buffer,
+    capacity: u32,
+    label: &'static str,
+}
+
+impl FlatInstances {
+    fn new(device: &wgpu::Device, label: &'static str) -> FlatInstances {
+        FlatInstances {
+            values: Vec::new(),
+            buffer: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: INSTANCE_SIZE * 64,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            capacity: 64,
+            label,
+        }
+    }
+
+    fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        if self.values.is_empty() {
+            return;
+        }
+        let needed = self.values.len() as u32;
+        if needed > self.capacity {
+            self.capacity = needed.next_power_of_two();
+            self.buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(self.label),
+                size: u64::from(self.capacity) * INSTANCE_SIZE,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+        queue.write_buffer(&self.buffer, 0, bytemuck::cast_slice(&self.values));
+    }
+}
+
+struct PanelMesh {
+    vertices: Vec<PanelVertex>,
+    buffer: wgpu::Buffer,
+    capacity: u32,
+    label: &'static str,
+}
+
+impl PanelMesh {
+    fn new(device: &wgpu::Device, label: &'static str) -> PanelMesh {
+        PanelMesh {
+            vertices: Vec::new(),
+            buffer: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: PANEL_VERTEX_SIZE * 64,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            capacity: 64,
+            label,
+        }
+    }
+
+    fn quad(&mut self, min: [f32; 2], max: [f32; 2], z: f32, color: [u8; 4]) {
+        let corners = [
+            [min[0], min[1], z],
+            [max[0], min[1], z],
+            [max[0], max[1], z],
+            [min[0], max[1], z],
+        ];
+        for index in [0, 1, 2, 0, 2, 3] {
+            self.vertices.push(PanelVertex { position: corners[index], color });
+        }
+    }
+
+    fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        if self.vertices.is_empty() {
+            return;
+        }
+        let needed = self.vertices.len() as u32;
+        if needed > self.capacity {
+            self.capacity = needed.next_power_of_two();
+            self.buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(self.label),
+                size: u64::from(self.capacity) * PANEL_VERTEX_SIZE,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+        queue.write_buffer(&self.buffer, 0, bytemuck::cast_slice(&self.vertices));
+    }
+}
+
+struct Metrics {
+    line_height: f32,
+    ascender: f32,
+    descender: f32,
+    advance: f32,
+}
+
+impl Metrics {
+    fn of(font: &Font) -> Metrics {
+        Metrics {
+            line_height: font.line_height(),
+            ascender: font.ascender(),
+            descender: font.descender(),
+            advance: font.advance(),
+        }
+    }
+
+    fn band(&self) -> f32 {
+        (self.ascender - self.descender).max(1e-3)
+    }
+}
+
+struct GlyphPass<'a> {
+    label: &'a str,
+    vertex_entry: &'a str,
+    fragment_entry: &'a str,
+    blend: Option<wgpu::BlendState>,
+    depth_write: bool,
 }
 
 pub struct Renderer {
@@ -134,28 +361,50 @@ pub struct Renderer {
 
     globals: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
+    shadow_bind_group: wgpu::BindGroup,
     background_pipeline: wgpu::RenderPipeline,
     glyph_pipeline: wgpu::RenderPipeline,
+    highlight_pipeline: wgpu::RenderPipeline,
     popup_pipeline: wgpu::RenderPipeline,
+    find_pipeline: wgpu::RenderPipeline,
     panel_pipeline: wgpu::RenderPipeline,
+    find_panel_pipeline: wgpu::RenderPipeline,
     grid_pipeline: wgpu::RenderPipeline,
+    shadow_pipeline: wgpu::RenderPipeline,
 
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
+    vertex_capacity: u64,
+    index_capacity: u64,
     cursor_buffer: wgpu::Buffer,
-    panel_buffer: wgpu::Buffer,
-    panel_capacity: u32,
-    panel_vertices: Vec<PanelVertex>,
+
+    popup_panel: PanelMesh,
+    find_panel: PanelMesh,
 
     text_instances: InstanceSet,
     popup_instances: InstanceSet,
+    find_instances: InstanceSet,
+    highlights: FlatInstances,
 
     depth_view: wgpu::TextureView,
     msaa_view: Option<wgpu::TextureView>,
+    shadow_view: wgpu::TextureView,
 
-    pub atlas: GlyphAtlas,
-    pub show_grid: bool,
-    pub wave: f32,
+    layout: LineLayout,
+    lod_state: Vec<u8>,
+    scratch_text: String,
+
+    metrics: Metrics,
+    cursor_y: f32,
+    text_min: Vec3,
+    text_max: Vec3,
+
+    shadows: bool,
+    depth_by_indent: bool,
+    bevel: bool,
+    grid_drawn: bool,
+
+    atlas: GlyphAtlas,
 }
 
 pub fn visible_lines(text: &TextBuffer) -> Range<usize> {
@@ -237,6 +486,28 @@ impl Renderer {
             }],
         });
 
+        let shadow_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("shadow-layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
+                    count: None,
+                },
+            ],
+        });
+
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("globals-bind"),
             layout: &bind_layout,
@@ -246,8 +517,40 @@ impl Renderer {
             }],
         });
 
-        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("pipeline-layout"),
+        let shadow_view = create_shadow(&device);
+        let shadow_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("shadow-sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            compare: Some(wgpu::CompareFunction::LessEqual),
+            ..Default::default()
+        });
+        let shadow_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("shadow-bind"),
+            layout: &shadow_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&shadow_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&shadow_sampler),
+                },
+            ],
+        });
+
+        let lit_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("lit-layout"),
+            bind_group_layouts: &[Some(&bind_layout), Some(&shadow_layout)],
+            immediate_size: 0,
+        });
+        let depth_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("depth-layout"),
             bind_group_layouts: &[Some(&bind_layout)],
             immediate_size: 0,
         });
@@ -260,36 +563,102 @@ impl Renderer {
             label: Some("stage"),
             source: wgpu::ShaderSource::Wgsl(include_str!("stage.wgsl").into()),
         });
+        let shadow_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("shadow"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shadow.wgsl").into()),
+        });
 
         let multisample = wgpu::MultisampleState {
             count: sample_count,
             mask: !0,
             alpha_to_coverage_enabled: false,
         };
+        let single_sample = wgpu::MultisampleState {
+            count: 1,
+            mask: !0,
+            alpha_to_coverage_enabled: false,
+        };
 
+        let mesh_attributes = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3];
+        let instance_attributes =
+            wgpu::vertex_attr_array![2 => Float32x3, 3 => Float32x2, 4 => Unorm8x4];
         let glyph_buffers = [
-            wgpu::VertexBufferLayout {
+            Some(wgpu::VertexBufferLayout {
                 array_stride: std::mem::size_of::<Vertex>() as u64,
                 step_mode: wgpu::VertexStepMode::Vertex,
-                attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3],
-            },
-            wgpu::VertexBufferLayout {
-                array_stride: std::mem::size_of::<Instance>() as u64,
+                attributes: &mesh_attributes,
+            }),
+            Some(wgpu::VertexBufferLayout {
+                array_stride: INSTANCE_SIZE,
                 step_mode: wgpu::VertexStepMode::Instance,
-                attributes: &wgpu::vertex_attr_array![2 => Float32x3, 3 => Unorm8x4],
-            },
+                attributes: &instance_attributes,
+            }),
         ];
 
         let glyph_pipeline = make_glyph_pipeline(
-            &device, &layout, &glyph_shader, "vs_main", &glyph_buffers, format, multisample,
+            &device,
+            &lit_layout,
+            &glyph_shader,
+            &glyph_buffers,
+            format,
+            multisample,
+            GlyphPass {
+                label: "glyph-pipeline",
+                vertex_entry: "vs_main",
+                fragment_entry: "fs_main",
+                blend: None,
+                depth_write: true,
+            },
+        );
+        let highlight_pipeline = make_glyph_pipeline(
+            &device,
+            &lit_layout,
+            &glyph_shader,
+            &glyph_buffers,
+            format,
+            multisample,
+            GlyphPass {
+                label: "highlight-pipeline",
+                vertex_entry: "vs_main",
+                fragment_entry: "fs_flat",
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                depth_write: false,
+            },
         );
         let popup_pipeline = make_glyph_pipeline(
-            &device, &layout, &glyph_shader, "vs_popup", &glyph_buffers, format, multisample,
+            &device,
+            &lit_layout,
+            &glyph_shader,
+            &glyph_buffers,
+            format,
+            multisample,
+            GlyphPass {
+                label: "popup-pipeline",
+                vertex_entry: "vs_popup",
+                fragment_entry: "fs_main",
+                blend: None,
+                depth_write: true,
+            },
+        );
+        let find_pipeline = make_glyph_pipeline(
+            &device,
+            &lit_layout,
+            &glyph_shader,
+            &glyph_buffers,
+            format,
+            multisample,
+            GlyphPass {
+                label: "find-pipeline",
+                vertex_entry: "vs_find",
+                fragment_entry: "fs_main",
+                blend: None,
+                depth_write: true,
+            },
         );
 
         let background_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("background-pipeline"),
-            layout: Some(&layout),
+            layout: Some(&lit_layout),
             vertex: wgpu::VertexState {
                 module: &stage_shader,
                 entry_point: Some("bg_vs"),
@@ -313,42 +682,22 @@ impl Renderer {
             cache: None,
         });
 
-        let panel_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("panel-pipeline"),
-            layout: Some(&layout),
-            vertex: wgpu::VertexState {
-                module: &stage_shader,
-                entry_point: Some("panel_vs"),
-                compilation_options: Default::default(),
-                buffers: &[Some(wgpu::VertexBufferLayout {
-                    array_stride: std::mem::size_of::<PanelVertex>() as u64,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Unorm8x4],
-                })],
-            },
-            primitive: wgpu::PrimitiveState {
-                cull_mode: None,
-                ..Default::default()
-            },
-            depth_stencil: Some(depth_state(false, wgpu::CompareFunction::Less)),
+        let panel_pipeline = make_panel_pipeline(
+            &device, &lit_layout, &stage_shader, "panel-pipeline", "panel_vs", format, multisample,
+        );
+        let find_panel_pipeline = make_panel_pipeline(
+            &device,
+            &lit_layout,
+            &stage_shader,
+            "find-panel-pipeline",
+            "find_panel_vs",
+            format,
             multisample,
-            fragment: Some(wgpu::FragmentState {
-                module: &stage_shader,
-                entry_point: Some("panel_fs"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
+        );
 
         let grid_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("grid-pipeline"),
-            layout: Some(&layout),
+            layout: Some(&lit_layout),
             vertex: wgpu::VertexState {
                 module: &stage_shader,
                 entry_point: Some("grid_vs"),
@@ -376,38 +725,56 @@ impl Renderer {
             cache: None,
         });
 
+        let shadow_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("shadow-pipeline"),
+            layout: Some(&depth_layout),
+            vertex: wgpu::VertexState {
+                module: &shadow_shader,
+                entry_point: Some("vs_shadow"),
+                compilation_options: Default::default(),
+                buffers: &glyph_buffers,
+            },
+            primitive: wgpu::PrimitiveState {
+                cull_mode: Some(wgpu::Face::Back),
+                ..Default::default()
+            },
+            depth_stencil: Some(depth_state(true, wgpu::CompareFunction::Less)),
+            multisample: single_sample,
+            fragment: None,
+            multiview_mask: None,
+            cache: None,
+        });
+
         let depth_view = create_depth(&device, &config, sample_count);
         let msaa_view = create_msaa(&device, &config, sample_count);
         let atlas = GlyphAtlas::new(font);
 
         let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("vertices"),
-            size: 64,
+            size: 4096,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let index_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("indices"),
-            size: 64,
+            size: 4096,
             usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let cursor_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("cursor"),
-            size: 16,
+            size: INSTANCE_SIZE,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let panel_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("panel"),
-            size: 1024,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let text_instances = InstanceSet::new(&device, "text-instances");
-        let popup_instances = InstanceSet::new(&device, "popup-instances");
 
         Ok(Renderer {
+            text_instances: InstanceSet::new(&device, "text-instances"),
+            popup_instances: InstanceSet::new(&device, "popup-instances"),
+            find_instances: InstanceSet::new(&device, "find-instances"),
+            highlights: FlatInstances::new(&device, "highlight-instances"),
+            popup_panel: PanelMesh::new(&device, "popup-panel"),
+            find_panel: PanelMesh::new(&device, "find-panel"),
             surface,
             device,
             queue,
@@ -415,24 +782,36 @@ impl Renderer {
             sample_count,
             globals,
             bind_group,
+            shadow_bind_group,
             background_pipeline,
             glyph_pipeline,
+            highlight_pipeline,
             popup_pipeline,
+            find_pipeline,
             panel_pipeline,
+            find_panel_pipeline,
             grid_pipeline,
+            shadow_pipeline,
             vertex_buffer,
             index_buffer,
+            vertex_capacity: 4096,
+            index_capacity: 4096,
             cursor_buffer,
-            panel_buffer,
-            panel_capacity: 64,
-            panel_vertices: Vec::new(),
-            text_instances,
-            popup_instances,
             depth_view,
             msaa_view,
+            shadow_view,
+            layout: LineLayout::default(),
+            lod_state: Vec::new(),
+            scratch_text: String::new(),
+            metrics: Metrics::of(font),
+            cursor_y: 0.0,
+            text_min: Vec3::splat(f32::INFINITY),
+            text_max: Vec3::splat(f32::NEG_INFINITY),
+            shadows: true,
+            depth_by_indent: true,
+            bevel: true,
+            grid_drawn: true,
             atlas,
-            show_grid: true,
-            wave: 0.014,
         })
     }
 
@@ -455,174 +834,429 @@ impl Renderer {
         self.config.height as f32
     }
 
-    pub fn rebuild(&mut self, text: &TextBuffer, font: &Font, highlighter: Option<&Highlighter>) {
-        let advance = font.advance();
-        let line_height = font.line_height();
+    pub fn shadows(&self) -> bool {
+        self.shadows
+    }
+
+    pub fn set_shadows(&mut self, enabled: bool) {
+        self.shadows = enabled;
+    }
+
+    pub fn depth_by_indent(&self) -> bool {
+        self.depth_by_indent
+    }
+
+    pub fn set_depth_by_indent(&mut self, enabled: bool) {
+        self.depth_by_indent = enabled;
+    }
+
+    pub fn bevel(&self) -> bool {
+        self.bevel
+    }
+
+    pub fn set_bevel(&mut self, enabled: bool, font: &Font) {
+        if self.bevel == enabled {
+            return;
+        }
+        self.bevel = enabled;
+        self.atlas.set_bevel(enabled, font);
+        self.invalidate_slots(font);
+    }
+
+    pub fn reset_font(&mut self, font: &Font) {
+        self.atlas.reset(font);
+        self.invalidate_slots(font);
+    }
+
+    fn invalidate_slots(&mut self, font: &Font) {
+        self.metrics = Metrics::of(font);
+        self.text_instances.discard();
+        self.popup_instances.discard();
+        self.find_instances.discard();
+        self.highlights.values.clear();
+        self.popup_panel.vertices.clear();
+        self.find_panel.vertices.clear();
+        self.lod_state.clear();
+        self.text_min = Vec3::splat(f32::INFINITY);
+        self.text_max = Vec3::splat(f32::NEG_INFINITY);
+        self.upload_atlas();
+    }
+
+    pub fn stats(&self) -> RenderStats {
+        let quad = &self.atlas.slots[self.atlas.quad_slot() as usize];
+        let cursor = &self.atlas.slots[self.atlas.cursor_slot as usize];
+        let highlight_count = self.highlights.values.len() as u32;
+        let instances = self.text_instances.values.len() as u32
+            + self.popup_instances.values.len() as u32
+            + self.find_instances.values.len() as u32
+            + highlight_count
+            + 1;
+        let triangles = self.text_instances.triangles
+            + self.popup_instances.triangles
+            + self.find_instances.triangles
+            + highlight_count * (quad.index_count / 3)
+            + cursor.index_count / 3;
+        let mut draws = 2 + self.text_instances.draws;
+        draws += self.popup_instances.draws + self.find_instances.draws;
+        if highlight_count > 0 {
+            draws += 1;
+        }
+        if self.grid_drawn {
+            draws += 1;
+        }
+        if !self.popup_panel.vertices.is_empty() {
+            draws += 1;
+        }
+        if !self.find_panel.vertices.is_empty() {
+            draws += 1;
+        }
+        RenderStats {
+            instances,
+            triangles,
+            atlas_bytes: self.atlas.memory_bytes(),
+            draws,
+        }
+    }
+
+    pub fn rebuild(
+        &mut self,
+        text: &TextBuffer,
+        font: &Font,
+        highlighter: Option<&Highlighter>,
+        camera: &Camera,
+    ) {
+        self.metrics = Metrics::of(font);
+        let line_height = self.metrics.line_height;
+        let descender = self.metrics.descender;
+        let band_scale = self.metrics.band() / line_height;
+        let advance = self.metrics.advance;
+        let eye = camera.eye();
+        let depth_by_indent = self.depth_by_indent;
         let window = visible_lines(text);
 
+        if self.lod_state.len() != text.line_count() {
+            self.lod_state.resize(text.line_count(), LOD_UNSET);
+        }
+
         self.text_instances.scratch.clear();
+        self.highlights.values.clear();
+
+        let current: Option<Match> = text
+            .current_match()
+            .and_then(|index| text.matches().get(index).copied());
+
+        let mut min = Vec3::splat(f32::INFINITY);
+        let mut max = Vec3::splat(f32::NEG_INFINITY);
+
         for line_index in window {
+            let line = text.lines[line_index].as_str();
+            self.layout.build(font, line);
             let y = -(line_index as f32) * line_height;
+            let indent = if depth_by_indent {
+                -(indent_level(line) as f32) * INDENT_DEPTH
+            } else {
+                0.0
+            };
+
+            let center = Vec3::new(self.layout.width * 0.5, y, indent);
+            let previous = self.lod_state[line_index];
+            let lod = pick_lod(eye.distance(center), previous);
+            self.lod_state[line_index] = lod;
+
             let line_start = text.line_start(line_index);
-            for (column, (byte, ch)) in text.lines[line_index].char_indices().enumerate() {
-                if ch == ' ' {
-                    continue;
-                }
-                let slot = self.atlas.slot_for(font, ch);
+            for placement in &self.layout.placements {
+                let slot = self.atlas.slot_for(font, placement.key, lod);
                 if slot == BLANK {
                     continue;
                 }
                 let style = match highlighter {
-                    Some(highlighter) => highlighter.style_at(line_start + byte),
-                    None => plain_style(ch),
+                    Some(highlighter) => highlighter.style_at(line_start + placement.byte),
+                    None => plain_style(line[placement.byte..].chars().next().unwrap_or(' ')),
                 };
                 self.text_instances.scratch.push((
                     slot,
                     Instance {
-                        offset: [column as f32 * advance, y, 0.0],
+                        offset: [placement.x, y, indent],
+                        scale: [1.0, 1.0],
                         color: STYLE_COLORS[style as usize],
                     },
                 ));
             }
+
+            if !self.layout.placements.is_empty() {
+                min.x = min.x.min(0.0);
+                max.x = max.x.max(self.layout.width);
+                min.y = min.y.min(y + descender);
+                max.y = max.y.max(y + self.metrics.ascender);
+                min.z = min.z.min(indent - GLYPH_HALF_DEPTH);
+                max.z = max.z.max(indent + GLYPH_HALF_DEPTH + CURRENT_LINE_LIFT);
+            }
+
+            let quad_y = y + descender;
+            let quad_z = indent + HIGHLIGHT_Z;
+            for found in text.match_on_line(line_index) {
+                let color = match current {
+                    Some(active) if active.line == found.line && active.start == found.start => {
+                        CURRENT_MATCH_COLOR
+                    }
+                    _ => MATCH_COLOR,
+                };
+                let (left, right) = self.span_x(found.start, found.end, advance);
+                push_span(
+                    &mut self.highlights.values,
+                    left,
+                    right,
+                    quad_y,
+                    quad_z,
+                    band_scale,
+                    color,
+                );
+            }
+            if let Some((start, end)) = text.selection_on_line(line_index) {
+                let (left, right) = self.span_x(start, end, advance);
+                push_span(
+                    &mut self.highlights.values,
+                    left,
+                    right,
+                    quad_y,
+                    quad_z,
+                    band_scale,
+                    SELECTION_COLOR,
+                );
+            }
         }
 
-        self.text_instances.group(self.atlas.slots.len());
-        self.upload_atlas();
-        self.text_instances
-            .upload(&self.device, &self.queue, "text-instances");
+        self.text_min = min;
+        self.text_max = max;
 
+        self.text_instances.group(&self.atlas.slots);
+        self.upload_atlas();
+        self.text_instances.upload(&self.device, &self.queue);
+        self.highlights.upload(&self.device, &self.queue);
+
+        let cursor_line = match text.lines.get(text.cursor_line) {
+            Some(line) => line.as_str(),
+            None => "",
+        };
+        self.layout.build(font, cursor_line);
+        let cursor_indent = if depth_by_indent {
+            -(indent_level(cursor_line) as f32) * INDENT_DEPTH
+        } else {
+            0.0
+        };
+        self.cursor_y = -(text.cursor_line as f32) * line_height;
         let cursor = Instance {
             offset: [
-                text.cursor_col as f32 * advance,
-                -(text.cursor_line as f32) * line_height,
-                0.0,
+                self.layout.x_of_column(text.cursor_col),
+                self.cursor_y,
+                cursor_indent,
             ],
-            color: [255, 194, 102, 255],
+            scale: [1.0, 1.0],
+            color: CURSOR_COLOR,
         };
         self.queue
             .write_buffer(&self.cursor_buffer, 0, bytemuck::bytes_of(&cursor));
     }
 
+    fn span_x(&self, start: usize, end: usize, advance: f32) -> (f32, f32) {
+        let count = self.layout.placements.len();
+        let left = self.layout.x_of_column(start);
+        let mut right = self.layout.x_of_column(end);
+        if end > count {
+            right += (end - count) as f32 * advance * 0.5;
+        }
+        (left, right)
+    }
+
     pub fn set_popup(&mut self, completion: &Completion, text: &TextBuffer, font: &Font) {
         self.popup_instances.scratch.clear();
-        self.panel_vertices.clear();
+        self.popup_panel.vertices.clear();
         if !completion.active {
-            self.popup_instances.values.clear();
+            self.popup_instances.discard();
             return;
         }
 
-        let advance = font.advance();
-        let line_height = font.line_height();
-        let origin_x = text.cursor_col as f32 * advance;
+        self.metrics = Metrics::of(font);
+        let advance = self.metrics.advance;
+        let line_height = self.metrics.line_height;
+        let cursor_line = match text.lines.get(text.cursor_line) {
+            Some(line) => line.as_str(),
+            None => "",
+        };
+        self.layout.build(font, cursor_line);
+        let origin_x = self.layout.x_of_column(text.cursor_col);
         let origin_y = -(text.cursor_line as f32) * line_height - line_height;
 
-        let rows = completion
+        let mut widest = 0.0f32;
+        let mut shown = 0usize;
+        for (row, candidate) in completion
             .items
             .iter()
             .skip(completion.scroll)
             .take(VISIBLE_ROWS)
-            .enumerate();
-        let mut widest = 0usize;
-
-        for (row, candidate) in rows {
+            .enumerate()
+        {
             let y = origin_y - row as f32 * line_height;
             let selected = completion.scroll + row == completion.selected;
-            widest = widest.max(candidate.text.chars().count());
-
             let (name_color, tag_color) = if selected {
                 ([255, 226, 176, 255], [198, 214, 240, 255])
             } else {
                 (STYLE_COLORS[candidate.kind.style() as usize], TAG_COLOR)
             };
             self.push_popup_text(font, candidate.kind.tag(), origin_x + 0.4 * advance, y, tag_color);
-            self.push_popup_text(
-                font,
-                &candidate.text,
-                origin_x + TAG_COLUMNS * advance,
-                y,
-                name_color,
-            );
+            let width =
+                self.push_popup_text(font, &candidate.text, origin_x + TAG_COLUMNS * advance, y, name_color);
+            widest = widest.max(width);
+            shown += 1;
         }
 
-        let shown = completion.items.len().saturating_sub(completion.scroll).min(VISIBLE_ROWS);
         let left = origin_x - 0.3;
-        let right = origin_x + (TAG_COLUMNS + widest as f32 + 0.6) * advance;
-        let top = origin_y + font.ascender() * 0.85 + 0.14;
+        let right = origin_x + TAG_COLUMNS * advance + widest + 0.6 * advance;
+        let top = origin_y + self.metrics.ascender * 0.85 + 0.14;
         let bottom = origin_y - (shown.saturating_sub(1)) as f32 * line_height
-            + font.descender() * 0.85
+            + self.metrics.descender * 0.85
             - 0.14;
 
-        push_quad(
-            &mut self.panel_vertices,
+        self.popup_panel.quad(
             [left - 0.08, bottom - 0.08],
             [right + 0.08, top + 0.08],
             POPUP_Z - 0.16,
             PANEL_EDGE,
         );
-        push_quad(
-            &mut self.panel_vertices,
-            [left, bottom],
-            [right, top],
-            POPUP_Z - 0.12,
-            PANEL_FILL,
-        );
+        self.popup_panel
+            .quad([left, bottom], [right, top], POPUP_Z - 0.12, PANEL_FILL);
 
         let row = completion.selected.saturating_sub(completion.scroll);
         let row_y = origin_y - row as f32 * line_height;
-        push_quad(
-            &mut self.panel_vertices,
-            [left, row_y + font.descender() * 0.85],
-            [right, row_y + font.ascender() * 0.85],
+        self.popup_panel.quad(
+            [left, row_y + self.metrics.descender * 0.85],
+            [right, row_y + self.metrics.ascender * 0.85],
             POPUP_Z - 0.06,
             PANEL_SELECTED,
         );
 
-        self.popup_instances.group(self.atlas.slots.len());
+        self.popup_instances.group(&self.atlas.slots);
         self.upload_atlas();
-        self.popup_instances
-            .upload(&self.device, &self.queue, "popup-instances");
-        self.upload_panel();
+        self.popup_instances.upload(&self.device, &self.queue);
+        self.popup_panel.upload(&self.device, &self.queue);
     }
 
-    fn push_popup_text(&mut self, font: &Font, text: &str, x: f32, y: f32, color: [u8; 4]) {
-        let advance = font.advance();
-        for (column, ch) in text.chars().enumerate() {
-            if ch == ' ' {
-                continue;
+    fn push_popup_text(&mut self, font: &Font, content: &str, x: f32, y: f32, color: [u8; 4]) -> f32 {
+        push_line(
+            &mut self.atlas,
+            &mut self.layout,
+            font,
+            content,
+            [x, y, POPUP_Z],
+            color,
+            &mut self.popup_instances.scratch,
+        )
+    }
+
+    pub fn set_find_bar(&mut self, bar: Option<FindBarView<'_>>, text: &TextBuffer, font: &Font) {
+        self.find_instances.scratch.clear();
+        self.find_panel.vertices.clear();
+        let Some(bar) = bar else {
+            self.find_instances.discard();
+            return;
+        };
+
+        self.metrics = Metrics::of(font);
+        let line_height = self.metrics.line_height;
+        let descender = self.metrics.descender;
+        let band_scale = self.metrics.band() / line_height;
+        let rows = if bar.replacing { 2usize } else { 1 };
+        let base = FIND_PAD - descender;
+
+        let query_y = base + (rows - 1) as f32 * line_height;
+        self.scratch_text.clear();
+        self.scratch_text.push_str("chercher: ");
+        let prefix = self.scratch_text.chars().count();
+        self.scratch_text.push_str(bar.query);
+        let query_width = self.push_find_scratch(font, FIND_PAD, query_y, prefix);
+
+        let mut caret_x = FIND_PAD + query_width;
+        let mut caret_y = query_y;
+        let mut widest = query_width;
+
+        if bar.replacing {
+            self.scratch_text.clear();
+            self.scratch_text.push_str("remplacer: ");
+            let prefix = self.scratch_text.chars().count();
+            self.scratch_text.push_str(bar.replacement);
+            let width = self.push_find_scratch(font, FIND_PAD, base, prefix);
+            widest = widest.max(width);
+            caret_x = FIND_PAD + width;
+            caret_y = base;
+        }
+
+        self.scratch_text.clear();
+        if bar.total == 0 {
+            self.scratch_text.push_str("aucun");
+        } else {
+            let position = bar.current.map(|index| index + 1).unwrap_or(0);
+            let _ = write!(self.scratch_text, "{}/{}", position, bar.total);
+            if let Some(found) = bar.current.and_then(|index| text.matches().get(index)) {
+                let _ = write!(self.scratch_text, "  ligne {}", found.line + 1);
             }
-            let slot = self.atlas.slot_for(font, ch);
+        }
+        self.layout.build(font, &self.scratch_text);
+        let counter = self.layout.width;
+        let width = FIND_PAD * 2.0 + widest + FIND_GAP + counter;
+        let height = (rows - 1) as f32 * line_height + self.metrics.band() + FIND_PAD * 2.0;
+        let counter_x = width - FIND_PAD - counter;
+        push_line(
+            &mut self.atlas,
+            &mut self.layout,
+            font,
+            &self.scratch_text,
+            [counter_x, query_y, 0.0],
+            FIND_COUNT_COLOR,
+            &mut self.find_instances.scratch,
+        );
+
+        self.find_instances.scratch.push((
+            self.atlas.quad_slot(),
+            Instance {
+                offset: [caret_x + 0.06, caret_y + descender, 0.0],
+                scale: [FIND_CARET_WIDTH, band_scale],
+                color: CURSOR_COLOR,
+            },
+        ));
+
+        self.find_panel
+            .quad([-0.09, -0.09], [width + 0.09, height + 0.09], -0.26, PANEL_EDGE);
+        self.find_panel
+            .quad([0.0, 0.0], [width, height], -0.22, PANEL_FILL);
+
+        self.find_instances.group(&self.atlas.slots);
+        self.upload_atlas();
+        self.find_instances.upload(&self.device, &self.queue);
+        self.find_panel.upload(&self.device, &self.queue);
+    }
+
+    fn push_find_scratch(&mut self, font: &Font, x: f32, y: f32, prefix: usize) -> f32 {
+        self.layout.build(font, &self.scratch_text);
+        for placement in &self.layout.placements {
+            let slot = self.atlas.slot_for(font, placement.key, LOD_NEAR);
             if slot == BLANK {
                 continue;
             }
-            self.popup_instances.scratch.push((
+            let color = if placement.column < prefix {
+                FIND_LABEL_COLOR
+            } else {
+                FIND_VALUE_COLOR
+            };
+            self.find_instances.scratch.push((
                 slot,
                 Instance {
-                    offset: [x + column as f32 * advance, y, POPUP_Z],
+                    offset: [x + placement.x, y, 0.0],
+                    scale: [1.0, 1.0],
                     color,
                 },
             ));
         }
-    }
-
-    fn upload_panel(&mut self) {
-        if self.panel_vertices.is_empty() {
-            return;
-        }
-        let needed = self.panel_vertices.len() as u32;
-        if needed > self.panel_capacity {
-            self.panel_capacity = needed.next_power_of_two();
-            self.panel_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("panel"),
-                size: u64::from(self.panel_capacity) * 16,
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-        }
-        self.queue.write_buffer(
-            &self.panel_buffer,
-            0,
-            bytemuck::cast_slice(&self.panel_vertices),
-        );
+        self.layout.width
     }
 
     fn upload_atlas(&mut self) {
@@ -635,18 +1269,24 @@ impl Renderer {
         if vertex_bytes.is_empty() || index_bytes.is_empty() {
             return;
         }
-        self.vertex_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("vertices"),
-            size: vertex_bytes.len() as u64,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        self.index_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("indices"),
-            size: index_bytes.len() as u64,
-            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        if vertex_bytes.len() as u64 > self.vertex_capacity {
+            self.vertex_capacity = (vertex_bytes.len() as u64).next_power_of_two();
+            self.vertex_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("vertices"),
+                size: self.vertex_capacity,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+        if index_bytes.len() as u64 > self.index_capacity {
+            self.index_capacity = (index_bytes.len() as u64).next_power_of_two();
+            self.index_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("indices"),
+                size: self.index_capacity,
+                usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
         self.queue.write_buffer(&self.vertex_buffer, 0, vertex_bytes);
         self.queue.write_buffer(&self.index_buffer, 0, index_bytes);
     }
@@ -654,135 +1294,624 @@ impl Renderer {
     pub fn render(
         &mut self,
         camera: &Camera,
-        font: &Font,
-        cursor_y: f32,
-        time: f32,
-        show_cursor: bool,
-    ) {
+        elapsed: f32,
+        wave: bool,
+        grid: bool,
+    ) -> Result<(), String> {
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame)
             | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
                 self.surface.configure(&self.device, &self.config);
-                return;
+                return Ok(());
             }
-            _ => return,
+            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+                return Ok(());
+            }
+            _ => return Err(String::from("surface indisponible")),
         };
 
-        let eye = camera.eye();
+        self.grid_drawn = grid;
+        self.write_globals(camera, elapsed, wave);
+
+        let view = frame.texture.create_view(&Default::default());
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
+        if self.casts_shadows() {
+            self.encode_shadow(&mut encoder);
+        }
+        let (target, resolve) = match &self.msaa_view {
+            Some(msaa) => (msaa, Some(&view)),
+            None => (&view, None),
+        };
+        self.encode_scene(&mut encoder, target, resolve, grid);
+        self.queue.submit(Some(encoder.finish()));
+        self.queue.present(frame);
+        Ok(())
+    }
+
+    pub fn capture(
+        &mut self,
+        camera: &Camera,
+        elapsed: f32,
+        wave: bool,
+        grid: bool,
+    ) -> Result<(u32, u32, Vec<u8>), String> {
+        let width = self.config.width.max(1);
+        let height = self.config.height.max(1);
+        let format = self.config.format;
+        let pixel = format
+            .block_copy_size(None)
+            .ok_or_else(|| String::from("format de surface non copiable"))?;
+        if pixel != 4 {
+            return Err(String::from("format de surface non pris en charge"));
+        }
+        let row_bytes = width * pixel;
+        let padded = row_bytes.div_ceil(256) * 256;
+
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("capture"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&Default::default());
+        let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("capture-readback"),
+            size: u64::from(padded) * u64::from(height),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        self.grid_drawn = grid;
+        self.write_globals(camera, elapsed, wave);
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("capture") });
+        if self.casts_shadows() {
+            self.encode_shadow(&mut encoder);
+        }
+        let (target, resolve) = match &self.msaa_view {
+            Some(msaa) => (msaa, Some(&view)),
+            None => (&view, None),
+        };
+        self.encode_scene(&mut encoder, target, resolve, grid);
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded),
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        let submission = self.queue.submit(Some(encoder.finish()));
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        readback.slice(..).map_async(wgpu::MapMode::Read, move |result| {
+            let _ = sender.send(result);
+        });
+        self.device
+            .poll(wgpu::PollType::Wait {
+                submission_index: Some(submission),
+                timeout: None,
+            })
+            .map_err(|err| format!("attente du peripherique ({err})"))?;
+        receiver
+            .recv()
+            .map_err(|_| String::from("capture interrompue"))?
+            .map_err(|_| String::from("capture illisible"))?;
+
+        let swap = matches!(
+            format,
+            wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
+        );
+        let mut rgba = vec![0u8; (row_bytes * height) as usize];
+        {
+            let mapped = readback
+                .slice(..)
+                .get_mapped_range()
+                .map_err(|err| format!("acces a la capture ({err})"))?;
+            let stride = padded as usize;
+            let line = row_bytes as usize;
+            for row in 0..height as usize {
+                let source = &mapped[row * stride..row * stride + line];
+                let destination = &mut rgba[row * line..row * line + line];
+                if swap {
+                    let (input, _) = source.as_chunks::<4>();
+                    let (output, _) = destination.as_chunks_mut::<4>();
+                    for (pixel, out) in input.iter().zip(output) {
+                        out[0] = pixel[2];
+                        out[1] = pixel[1];
+                        out[2] = pixel[0];
+                        out[3] = pixel[3];
+                    }
+                } else {
+                    destination.copy_from_slice(source);
+                }
+            }
+        }
+        readback.unmap();
+        Ok((width, height, rgba))
+    }
+
+    pub fn scene_mesh(
+        &self,
+        text: &TextBuffer,
+        font: &Font,
+        highlighter: Option<&Highlighter>,
+    ) -> SceneMesh {
+        let mut atlas = GlyphAtlas::new(font);
+        atlas.set_bevel(self.bevel, font);
+        let mut layout = LineLayout::default();
+        let window = visible_lines(text);
+        let mut expected = 0usize;
+        for line_index in window.clone() {
+            expected += text.line_chars(line_index);
+        }
+        let mut items: Vec<(u32, u32, [f32; 3])> = Vec::with_capacity(expected);
         let line_height = font.line_height();
+
+        for line_index in window {
+            let line = text.lines[line_index].as_str();
+            layout.build(font, line);
+            let y = -(line_index as f32) * line_height;
+            let indent = if self.depth_by_indent {
+                -(indent_level(line) as f32) * INDENT_DEPTH
+            } else {
+                0.0
+            };
+            let line_start = text.line_start(line_index);
+            for placement in &layout.placements {
+                let slot = atlas.slot_for(font, placement.key, LOD_NEAR);
+                if slot == BLANK {
+                    continue;
+                }
+                let style = match highlighter {
+                    Some(highlighter) => highlighter.style_at(line_start + placement.byte),
+                    None => plain_style(line[placement.byte..].chars().next().unwrap_or(' ')),
+                };
+                let color = STYLE_COLORS[style as usize];
+                items.push((u32::from_le_bytes(color), slot, [placement.x, y, indent]));
+            }
+        }
+        items.sort_unstable_by_key(|item| item.0);
+
+        let spans = slot_spans(&atlas);
+        let mut vertex_total = 0usize;
+        let mut index_total = 0usize;
+        for (_, slot, _) in &items {
+            vertex_total += spans[*slot as usize] as usize;
+            index_total += atlas.slots[*slot as usize].index_count as usize;
+        }
+
+        let mut mesh = SceneMesh::default();
+        mesh.vertices.reserve_exact(vertex_total);
+        mesh.normals.reserve_exact(vertex_total);
+        mesh.colors.reserve_exact(vertex_total);
+        mesh.indices.reserve_exact(index_total);
+        let mut index = 0usize;
+        while index < items.len() {
+            let key = items[index].0;
+            let color = key.to_le_bytes();
+            let start = mesh.indices.len() as u32;
+            while index < items.len() && items[index].0 == key {
+                let (_, slot, offset) = items[index];
+                let entry = &atlas.slots[slot as usize];
+                let base = mesh.vertices.len() as u32;
+                let first = entry.base_vertex as usize;
+                let span = spans[slot as usize] as usize;
+                for vertex in &atlas.vertices[first..first + span] {
+                    mesh.vertices.push([
+                        vertex.position[0] + offset[0],
+                        vertex.position[1] + offset[1],
+                        vertex.position[2] + offset[2],
+                    ]);
+                    mesh.normals.push(vertex.normal);
+                    mesh.colors.push(color);
+                }
+                let from = entry.index_start as usize;
+                let to = from + entry.index_count as usize;
+                for value in &atlas.indices[from..to] {
+                    mesh.indices.push(base + value);
+                }
+                index += 1;
+            }
+            mesh.groups.push(MeshGroup {
+                color,
+                start,
+                count: mesh.indices.len() as u32 - start,
+            });
+        }
+        mesh
+    }
+
+    fn casts_shadows(&self) -> bool {
+        self.shadows && !self.atlas.indices.is_empty() && self.text_min.x <= self.text_max.x
+    }
+
+    fn write_globals(&self, camera: &Camera, elapsed: f32, wave: bool) {
+        let aspect = self.aspect();
+        let eye = camera.eye();
+        let line_height = self.metrics.line_height;
         let cull_reach = VISIBLE_RADIUS as f32 * line_height * 0.92;
         let fog_end = (camera.distance * 4.2).min(cull_reach);
         let fog_start = (camera.distance * 1.25).min(fog_end * 0.4);
         let light = Vec3::new(0.42, 0.76, 0.55).normalize();
-        let (_, half_height) = camera.half_extent(self.aspect());
+        let (half_width, half_height) = camera.half_extent(aspect);
+        let ground_y = camera.target.y - half_height * 1.25;
+
+        let shadows_on = self.casts_shadows();
+        let light_view_proj = if shadows_on {
+            let reach = Vec3::splat((half_width.max(half_height) * 1.6).max(4.0));
+            let low = self.text_min.max(camera.target - reach);
+            let high = self.text_max.min(camera.target + reach);
+            light_matrix(low, high, ground_y, light)
+        } else {
+            Mat4::IDENTITY
+        };
+
+        let plane = 1.0 - FIND_PLANE;
+        let right = camera.right();
+        let up = camera.up();
+        let center = camera.target - camera.forward() * (camera.distance * FIND_PLANE);
+        let anchor = center - right * (half_width * plane * 0.94) - up * (half_height * plane * 0.94);
+        let find_scale = 2.0 * half_height * plane * FIND_TEXT_FRACTION / line_height;
 
         let globals = Globals {
-            view_proj: camera.view_proj(self.aspect()).to_cols_array_2d(),
+            view_proj: camera.view_proj(aspect).to_cols_array_2d(),
+            light_view_proj: light_view_proj.to_cols_array_2d(),
             camera_pos: [eye.x, eye.y, eye.z, 1.0],
             light_dir: [light.x, light.y, light.z, 0.0],
-            fog: [fog_start, fog_end, cursor_y, line_height],
+            fog: [fog_start, fog_end, self.cursor_y, line_height],
             bg_top: BG_TOP,
             bg_bottom: BG_BOTTOM,
             ink: INK,
             accent: ACCENT,
             highlight: HIGHLIGHT,
             ground: [
-                camera.target.y - half_height * 1.25,
+                ground_y,
                 2.0,
                 camera.distance * 0.8,
                 camera.distance * 2.6,
             ],
             params: [
-                time,
-                self.wave,
+                elapsed,
+                if wave { WAVE_AMPLITUDE } else { 0.0 },
                 self.config.width as f32,
                 self.config.height as f32,
             ],
+            shadow: [
+                1.0 / SHADOW_SIZE as f32,
+                if shadows_on { 1.0 } else { 0.0 },
+                SHADOW_CONTACT,
+                0.0,
+            ],
+            find_anchor: [anchor.x, anchor.y, anchor.z, find_scale],
+            find_right: [right.x, right.y, right.z, 0.0],
+            find_up: [up.x, up.y, up.z, 0.0],
         };
         self.queue
             .write_buffer(&self.globals, 0, bytemuck::bytes_of(&globals));
+    }
 
-        let view = frame.texture.create_view(&Default::default());
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
-
-        {
-            let (target, resolve) = match &self.msaa_view {
-                Some(msaa) => (msaa, Some(&view)),
-                None => (&view, None),
-            };
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("main"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: target,
-                    resolve_target: resolve,
-                    depth_slice: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &self.depth_view,
-                    depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(1.0),
-                        store: wgpu::StoreOp::Discard,
-                    }),
-                    stencil_ops: None,
+    fn encode_shadow(&self, encoder: &mut wgpu::CommandEncoder) {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("shadow"),
+            color_attachments: &[],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &self.shadow_view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: wgpu::StoreOp::Store,
                 }),
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
 
-            pass.set_bind_group(0, &self.bind_group, &[]);
-            pass.set_pipeline(&self.background_pipeline);
-            pass.draw(0..3, 0..1);
+        pass.set_bind_group(0, &self.bind_group, &[]);
+        pass.set_pipeline(&self.shadow_pipeline);
+        pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+        pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
 
-            if !self.atlas.indices.is_empty() {
-                pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-                pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+        if !self.text_instances.values.is_empty() {
+            pass.set_vertex_buffer(1, self.text_instances.buffer.slice(..));
+            draw_groups(&mut pass, &self.atlas, &self.text_instances.offsets);
+        }
+        let cursor = &self.atlas.slots[self.atlas.cursor_slot as usize];
+        pass.set_vertex_buffer(1, self.cursor_buffer.slice(..));
+        pass.draw_indexed(
+            cursor.index_start..cursor.index_start + cursor.index_count,
+            cursor.base_vertex,
+            0..1,
+        );
+    }
 
-                pass.set_pipeline(&self.glyph_pipeline);
-                if !self.text_instances.values.is_empty() {
-                    pass.set_vertex_buffer(1, self.text_instances.buffer.slice(..));
-                    draw_groups(&mut pass, &self.atlas, &self.text_instances.offsets);
-                }
+    fn encode_scene(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        color: &wgpu::TextureView,
+        resolve: Option<&wgpu::TextureView>,
+        grid: bool,
+    ) {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("main"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: color,
+                resolve_target: resolve,
+                depth_slice: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &self.depth_view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: wgpu::StoreOp::Discard,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
 
-                if show_cursor {
-                    let slot = &self.atlas.slots[self.atlas.cursor_slot as usize];
-                    pass.set_vertex_buffer(1, self.cursor_buffer.slice(..));
-                    pass.draw_indexed(
-                        slot.index_start..slot.index_start + slot.index_count,
-                        slot.base_vertex,
-                        0..1,
-                    );
-                }
+        pass.set_bind_group(0, &self.bind_group, &[]);
+        pass.set_bind_group(1, &self.shadow_bind_group, &[]);
+        pass.set_pipeline(&self.background_pipeline);
+        pass.draw(0..3, 0..1);
 
-                if !self.popup_instances.values.is_empty() {
-                    pass.set_pipeline(&self.popup_pipeline);
-                    pass.set_vertex_buffer(1, self.popup_instances.buffer.slice(..));
-                    draw_groups(&mut pass, &self.atlas, &self.popup_instances.offsets);
-                }
+        if !self.atlas.indices.is_empty() {
+            pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+            pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+
+            if !self.highlights.values.is_empty() {
+                let quad = &self.atlas.slots[self.atlas.quad_slot() as usize];
+                pass.set_pipeline(&self.highlight_pipeline);
+                pass.set_vertex_buffer(1, self.highlights.buffer.slice(..));
+                pass.draw_indexed(
+                    quad.index_start..quad.index_start + quad.index_count,
+                    quad.base_vertex,
+                    0..self.highlights.values.len() as u32,
+                );
             }
 
-            if self.show_grid {
-                pass.set_pipeline(&self.grid_pipeline);
-                pass.draw(0..4, 0..1);
+            pass.set_pipeline(&self.glyph_pipeline);
+            if !self.text_instances.values.is_empty() {
+                pass.set_vertex_buffer(1, self.text_instances.buffer.slice(..));
+                draw_groups(&mut pass, &self.atlas, &self.text_instances.offsets);
             }
 
-            if !self.panel_vertices.is_empty() {
-                pass.set_pipeline(&self.panel_pipeline);
-                pass.set_vertex_buffer(0, self.panel_buffer.slice(..));
-                pass.draw(0..self.panel_vertices.len() as u32, 0..1);
+            let cursor = &self.atlas.slots[self.atlas.cursor_slot as usize];
+            pass.set_vertex_buffer(1, self.cursor_buffer.slice(..));
+            pass.draw_indexed(
+                cursor.index_start..cursor.index_start + cursor.index_count,
+                cursor.base_vertex,
+                0..1,
+            );
+
+            if !self.popup_instances.values.is_empty() {
+                pass.set_pipeline(&self.popup_pipeline);
+                pass.set_vertex_buffer(1, self.popup_instances.buffer.slice(..));
+                draw_groups(&mut pass, &self.atlas, &self.popup_instances.offsets);
             }
         }
 
-        self.queue.submit(Some(encoder.finish()));
-        self.queue.present(frame);
+        if grid {
+            pass.set_pipeline(&self.grid_pipeline);
+            pass.draw(0..4, 0..1);
+        }
+
+        if !self.popup_panel.vertices.is_empty() {
+            pass.set_pipeline(&self.panel_pipeline);
+            pass.set_vertex_buffer(0, self.popup_panel.buffer.slice(..));
+            pass.draw(0..self.popup_panel.vertices.len() as u32, 0..1);
+        }
+
+        if !self.find_panel.vertices.is_empty() {
+            pass.set_pipeline(&self.find_panel_pipeline);
+            pass.set_vertex_buffer(0, self.find_panel.buffer.slice(..));
+            pass.draw(0..self.find_panel.vertices.len() as u32, 0..1);
+        }
+
+        if !self.find_instances.values.is_empty() && !self.atlas.indices.is_empty() {
+            pass.set_pipeline(&self.find_pipeline);
+            pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+            pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+            pass.set_vertex_buffer(1, self.find_instances.buffer.slice(..));
+            draw_groups(&mut pass, &self.atlas, &self.find_instances.offsets);
+        }
     }
+}
+
+fn push_line(
+    atlas: &mut GlyphAtlas,
+    layout: &mut LineLayout,
+    font: &Font,
+    content: &str,
+    origin: [f32; 3],
+    color: [u8; 4],
+    out: &mut Vec<(u32, Instance)>,
+) -> f32 {
+    layout.build(font, content);
+    for placement in &layout.placements {
+        let slot = atlas.slot_for(font, placement.key, LOD_NEAR);
+        if slot == BLANK {
+            continue;
+        }
+        out.push((
+            slot,
+            Instance {
+                offset: [origin[0] + placement.x, origin[1], origin[2]],
+                scale: [1.0, 1.0],
+                color,
+            },
+        ));
+    }
+    layout.width
+}
+
+fn push_span(
+    out: &mut Vec<Instance>,
+    left: f32,
+    right: f32,
+    y: f32,
+    z: f32,
+    band_scale: f32,
+    color: [u8; 4],
+) {
+    let width = right - left;
+    if width <= 1e-4 {
+        return;
+    }
+    out.push(Instance {
+        offset: [left, y, z],
+        scale: [width, band_scale],
+        color,
+    });
+}
+
+fn slot_spans(atlas: &GlyphAtlas) -> Vec<u32> {
+    let mut spans = Vec::with_capacity(atlas.slots.len());
+    for slot in &atlas.slots {
+        let from = slot.index_start as usize;
+        let to = from + slot.index_count as usize;
+        let mut highest = 0u32;
+        for value in &atlas.indices[from..to] {
+            highest = highest.max(*value);
+        }
+        spans.push(if slot.index_count == 0 { 0 } else { highest + 1 });
+    }
+    spans
+}
+
+fn pick_lod(distance: f32, previous: u8) -> u8 {
+    let near_out = LOD_NEAR_LIMIT * (1.0 + LOD_HYSTERESIS);
+    let near_in = LOD_NEAR_LIMIT * (1.0 - LOD_HYSTERESIS);
+    let far_out = LOD_FAR_LIMIT * (1.0 + LOD_HYSTERESIS);
+    let far_in = LOD_FAR_LIMIT * (1.0 - LOD_HYSTERESIS);
+    match previous {
+        LOD_NEAR => {
+            if distance > far_out {
+                LOD_FAR
+            } else if distance > near_out {
+                LOD_MID
+            } else {
+                LOD_NEAR
+            }
+        }
+        LOD_MID => {
+            if distance < near_in {
+                LOD_NEAR
+            } else if distance > far_out {
+                LOD_FAR
+            } else {
+                LOD_MID
+            }
+        }
+        LOD_FAR => {
+            if distance < near_in {
+                LOD_NEAR
+            } else if distance < far_in {
+                LOD_MID
+            } else {
+                LOD_FAR
+            }
+        }
+        _ => {
+            if distance < LOD_NEAR_LIMIT {
+                LOD_NEAR
+            } else if distance < LOD_FAR_LIMIT {
+                LOD_MID
+            } else {
+                LOD_FAR
+            }
+        }
+    }
+}
+
+fn indent_level(line: &str) -> usize {
+    let mut columns = 0usize;
+    for byte in line.as_bytes() {
+        match byte {
+            b' ' => columns += 1,
+            b'\t' => columns += TAB_WIDTH,
+            _ => break,
+        }
+    }
+    (columns / TAB_WIDTH).min(MAX_INDENT_LEVEL)
+}
+
+fn light_matrix(min: Vec3, max: Vec3, ground_y: f32, light: Vec3) -> Mat4 {
+    let low = Vec3::new(min.x, min.y.min(ground_y), min.z);
+    let high = max.max(low + Vec3::splat(1e-3));
+    let center = (low + high) * 0.5;
+    let radius = ((high - low).length() * 0.5).max(1.0);
+    let up = if light.y.abs() > 0.95 { Vec3::Z } else { Vec3::Y };
+    let view = glam::camera::rh::view::look_at_mat4(center + light * (radius + 2.0), center, up);
+
+    let mut local_min = Vec3::splat(f32::INFINITY);
+    let mut local_max = Vec3::splat(f32::NEG_INFINITY);
+    for corner in 0..8u32 {
+        let point = Vec3::new(
+            if corner & 1 == 0 { low.x } else { high.x },
+            if corner & 2 == 0 { low.y } else { high.y },
+            if corner & 4 == 0 { low.z } else { high.z },
+        );
+        let local = view.transform_point3(point);
+        local_min = local_min.min(local);
+        local_max = local_max.max(local);
+    }
+
+    let extent_x = quantize(local_max.x - local_min.x + SHADOW_MARGIN * 2.0);
+    let extent_y = quantize(local_max.y - local_min.y + SHADOW_MARGIN * 2.0);
+    let texel_x = extent_x / SHADOW_SIZE as f32;
+    let texel_y = extent_y / SHADOW_SIZE as f32;
+    let center_x = (((local_min.x + local_max.x) * 0.5) / texel_x).floor() * texel_x;
+    let center_y = (((local_min.y + local_max.y) * 0.5) / texel_y).floor() * texel_y;
+    let near = (-local_max.z - SHADOW_MARGIN).max(0.02);
+    let far = (-local_min.z + SHADOW_MARGIN).max(near + 0.1);
+
+    let proj = glam::camera::rh::proj::directx::orthographic(
+        center_x - extent_x * 0.5,
+        center_x + extent_x * 0.5,
+        center_y - extent_y * 0.5,
+        center_y + extent_y * 0.5,
+        near,
+        far,
+    );
+    proj * view
+}
+
+fn quantize(extent: f32) -> f32 {
+    (extent.max(SHADOW_QUANTUM) / SHADOW_QUANTUM).ceil() * SHADOW_QUANTUM
 }
 
 fn draw_groups(pass: &mut wgpu::RenderPass<'_>, atlas: &GlyphAtlas, offsets: &[u32]) {
@@ -801,18 +1930,6 @@ fn draw_groups(pass: &mut wgpu::RenderPass<'_>, atlas: &GlyphAtlas, offsets: &[u
     }
 }
 
-fn push_quad(out: &mut Vec<PanelVertex>, min: [f32; 2], max: [f32; 2], z: f32, color: [u8; 4]) {
-    let corners = [
-        [min[0], min[1], z],
-        [max[0], min[1], z],
-        [max[0], max[1], z],
-        [min[0], max[1], z],
-    ];
-    for index in [0, 1, 2, 0, 2, 3] {
-        out.push(PanelVertex { position: corners[index], color });
-    }
-}
-
 fn plain_style(ch: char) -> u8 {
     if ch.is_ascii_digit() {
         9
@@ -827,33 +1944,76 @@ fn make_glyph_pipeline(
     device: &wgpu::Device,
     layout: &wgpu::PipelineLayout,
     shader: &wgpu::ShaderModule,
-    entry: &str,
-    buffers: &[wgpu::VertexBufferLayout<'_>; 2],
+    buffers: &[Option<wgpu::VertexBufferLayout<'_>>; 2],
     format: wgpu::TextureFormat,
     multisample: wgpu::MultisampleState,
+    pass: GlyphPass<'_>,
 ) -> wgpu::RenderPipeline {
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some(entry),
+        label: Some(pass.label),
         layout: Some(layout),
         vertex: wgpu::VertexState {
             module: shader,
-            entry_point: Some(entry),
+            entry_point: Some(pass.vertex_entry),
             compilation_options: Default::default(),
-            buffers: &[Some(buffers[0].clone()), Some(buffers[1].clone())],
+            buffers,
         },
         primitive: wgpu::PrimitiveState {
             cull_mode: Some(wgpu::Face::Back),
             ..Default::default()
         },
-        depth_stencil: Some(depth_state(true, wgpu::CompareFunction::Less)),
+        depth_stencil: Some(depth_state(pass.depth_write, wgpu::CompareFunction::Less)),
         multisample,
         fragment: Some(wgpu::FragmentState {
             module: shader,
-            entry_point: Some("fs_main"),
+            entry_point: Some(pass.fragment_entry),
             compilation_options: Default::default(),
             targets: &[Some(wgpu::ColorTargetState {
                 format,
-                blend: None,
+                blend: pass.blend,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+fn make_panel_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    label: &str,
+    entry: &str,
+    format: wgpu::TextureFormat,
+    multisample: wgpu::MultisampleState,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some(label),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some(entry),
+            compilation_options: Default::default(),
+            buffers: &[Some(wgpu::VertexBufferLayout {
+                array_stride: PANEL_VERTEX_SIZE,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Unorm8x4],
+            })],
+        },
+        primitive: wgpu::PrimitiveState {
+            cull_mode: None,
+            ..Default::default()
+        },
+        depth_stencil: Some(depth_state(false, wgpu::CompareFunction::Less)),
+        multisample,
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some("panel_fs"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
                 write_mask: wgpu::ColorWrites::ALL,
             })],
         }),
@@ -870,6 +2030,25 @@ fn depth_state(write: bool, compare: wgpu::CompareFunction) -> wgpu::DepthStenci
         stencil: wgpu::StencilState::default(),
         bias: wgpu::DepthBiasState::default(),
     }
+}
+
+fn create_shadow(device: &wgpu::Device) -> wgpu::TextureView {
+    device
+        .create_texture(&wgpu::TextureDescriptor {
+            label: Some("shadow-map"),
+            size: wgpu::Extent3d {
+                width: SHADOW_SIZE,
+                height: SHADOW_SIZE,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: DEPTH_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        })
+        .create_view(&Default::default())
 }
 
 fn create_depth(

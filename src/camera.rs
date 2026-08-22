@@ -6,6 +6,7 @@ const MIN_DISTANCE: f32 = 1.5;
 const MAX_DISTANCE: f32 = 400.0;
 const ORBIT_SPEED: f32 = 0.006;
 const FOLLOW_RATE: f32 = 14.0;
+const FRAME_MARGIN: f32 = 1.12;
 
 pub struct Camera {
     pub target: Vec3,
@@ -91,6 +92,19 @@ impl Camera {
 
     pub fn snap(&mut self) {
         self.target = self.focus + self.pan;
+    }
+
+    pub fn frame_selection(&mut self, min: Vec3, max: Vec3, aspect: f32) {
+        let center = (min + max) * 0.5;
+        let extent = ((max - min) * 0.5).abs();
+        let tangent = (self.fov * 0.5).tan().max(1.0e-3);
+        let fit_height = extent.y / tangent;
+        let fit_width = extent.x / (tangent * aspect.max(0.01));
+        let needed = fit_height.max(fit_width) * FRAME_MARGIN + extent.z + 1.0;
+        self.distance = needed.clamp(MIN_DISTANCE, MAX_DISTANCE);
+        self.pan = Vec3::ZERO;
+        self.focus = center;
+        self.target = center;
     }
 
     pub fn update(&mut self, dt: f32) {
