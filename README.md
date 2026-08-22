@@ -14,6 +14,13 @@ les consulter.
 | terminal | sol | la sortie des tâches cargo / dotnet |
 | résultats | plafond | la recherche projet et les références |
 
+![démonstration](media/demo.gif)
+
+Une session réelle, enregistrée par le mode démo intégré (`text3d --demo --record`) : le relief des
+glyphes en orbite, la complétion typée de rust-analyzer, l'aller à la définition, l'ouverture
+rapide, une compilation, puis le tour de la pièce — l'arbre à gauche, le terminal au sol, les
+problèmes à droite. Version longue et sans perte : [media/demo.mp4](media/demo.mp4).
+
 Restent face caméra : les palettes (ouverture rapide, symboles, commandes, renommage), la barre
 d'état, la carte de survol, l'aide à la signature et le popup de complétion.
 
