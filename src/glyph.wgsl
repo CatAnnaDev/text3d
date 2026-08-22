@@ -13,8 +13,9 @@ struct Globals {
     params: vec4<f32>,
     shadow: vec4<f32>,
     find_anchor: vec4<f32>,
-    find_right: vec4<f32>,
-    find_up: vec4<f32>,
+    screen_right: vec4<f32>,
+    screen_up: vec4<f32>,
+    hud: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> g: Globals;
@@ -93,8 +94,8 @@ fn vs_find(
     @location(4) color: vec4<f32>,
 ) -> VsOut {
     let local = vec3<f32>(position.x * scale.x, position.y * scale.y, position.z) + offset;
-    let right = g.find_right.xyz;
-    let up = g.find_up.xyz;
+    let right = g.screen_right.xyz;
+    let up = g.screen_up.xyz;
     let toward = cross(right, up);
     var out: VsOut;
     out.world = g.find_anchor.xyz
@@ -104,6 +105,36 @@ fn vs_find(
     out.color = color;
     out.line_factor = 0.0;
     out.shadowed = 0.0;
+    return out;
+}
+
+const HUD_BASE_DEPTH: f32 = 0.30;
+const HUD_DEPTH_SCALE: f32 = 0.02;
+
+struct HudOut {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) normal: vec3<f32>,
+    @location(1) color: vec4<f32>,
+};
+
+@vertex
+fn vs_hud(
+    @location(0) position: vec3<f32>,
+    @location(1) normal: vec3<f32>,
+    @location(2) offset: vec3<f32>,
+    @location(3) scale: vec2<f32>,
+    @location(4) color: vec4<f32>,
+) -> HudOut {
+    let local = vec3<f32>(position.x * scale.x, position.y * scale.y, position.z) + offset;
+    var out: HudOut;
+    out.clip = vec4<f32>(
+        local.x * g.hud.x + g.hud.y,
+        local.y * g.hud.z + g.hud.w,
+        HUD_BASE_DEPTH - local.z * HUD_DEPTH_SCALE,
+        1.0,
+    );
+    out.normal = normal;
+    out.color = color;
     return out;
 }
 
@@ -195,5 +226,23 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 
 @fragment
 fn fs_flat(in: VsOut) -> @location(0) vec4<f32> {
+    return in.color;
+}
+
+@fragment
+fn fs_hud(in: HudOut) -> @location(0) vec4<f32> {
+    let n = normalize(in.normal);
+    let view = vec3<f32>(0.0, 0.0, 1.0);
+    let key_dir = normalize(vec3<f32>(-0.34, 0.48, 0.81));
+    let key = max(dot(n, key_dir), 0.0);
+    let face = max(n.z, 0.0);
+    let spec = ggx_specular(n, view, key_dir, 0.24) * key;
+    var color = in.color.rgb * (0.46 + 0.32 * key + 0.30 * face);
+    color = color + vec3<f32>(1.0, 0.98, 0.94) * spec * 0.8;
+    return vec4<f32>(color, in.color.a);
+}
+
+@fragment
+fn fs_hud_flat(in: HudOut) -> @location(0) vec4<f32> {
     return in.color;
 }

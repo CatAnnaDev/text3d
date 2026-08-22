@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use nucleo_matcher::pattern::{Atom, AtomKind, CaseMatching, Normalization};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 
+use crate::lsp::protocol::CompletionItem;
 use crate::syntax::{Highlighter, Language, SymbolKind};
 use crate::text::TextBuffer;
 
@@ -60,6 +61,20 @@ impl Kind {
         }
     }
 
+    pub fn from_language(code: u32) -> Kind {
+        match code {
+            2 | 4 | 23 => Kind::Method,
+            3 => Kind::Function,
+            7 => Kind::Class,
+            8 => Kind::Interface,
+            9 | 19 => Kind::Module,
+            13 | 22 | 25 => Kind::Type,
+            14 | 24 => Kind::Keyword,
+            15 => Kind::Macro,
+            _ => Kind::Word,
+        }
+    }
+
     fn of(symbol: SymbolKind) -> Kind {
         match symbol {
             SymbolKind::Function => Kind::Function,
@@ -73,8 +88,15 @@ impl Kind {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Source {
+    Local,
+    Language,
+}
+
 pub struct Candidate {
     pub text: String,
+    pub detail: String,
     pub kind: Kind,
 }
 
@@ -85,6 +107,7 @@ pub struct Completion {
     pub scroll: usize,
     pub prefix_chars: usize,
     prefix: String,
+    source: Source,
     pool: Vec<Candidate>,
     pool_version: u64,
     pool_language: Option<Language>,
@@ -102,6 +125,7 @@ impl Completion {
             scroll: 0,
             prefix_chars: 0,
             prefix: String::new(),
+            source: Source::Local,
             pool: Vec::new(),
             pool_version: 0,
             pool_language: None,
@@ -116,6 +140,15 @@ impl Completion {
         self.items.clear();
         self.selected = 0;
         self.scroll = 0;
+        self.source = Source::Local;
+    }
+
+    pub fn source(&self) -> Source {
+        self.source
+    }
+
+    pub fn prefix(&self) -> &str {
+        &self.prefix
     }
 
     pub fn move_selection(&mut self, delta: isize) {
@@ -151,6 +184,7 @@ impl Completion {
         self.prefix.clear();
         self.prefix.push_str(prefix);
         self.prefix_chars = self.prefix.chars().count();
+        self.source = Source::Local;
 
         if self.pool_version != text.version() || self.pool_language != language {
             self.pool_version = text.version();
@@ -181,16 +215,75 @@ impl Completion {
         self.ranked.truncate(MAX_ITEMS);
 
         self.items.clear();
+        self.items.reserve(self.ranked.len());
         for &(_, index) in &self.ranked {
             let candidate = &self.pool[index];
             self.items.push(Candidate {
                 text: candidate.text.clone(),
+                detail: String::new(),
                 kind: candidate.kind,
             });
         }
         self.selected = 0;
         self.scroll = 0;
         self.active = !self.items.is_empty();
+    }
+
+    pub fn set_language_items(&mut self, items: &[CompletionItem], prefix: &str) {
+        if items.is_empty() {
+            return;
+        }
+        self.prefix.clear();
+        self.prefix.push_str(prefix);
+        self.prefix_chars = self.prefix.chars().count();
+
+        self.ranked.clear();
+        self.ranked.reserve(items.len());
+        if self.prefix.is_empty() {
+            for index in 0..items.len() {
+                self.ranked.push((0, index));
+            }
+        } else {
+            let atom = Atom::new(
+                &self.prefix,
+                CaseMatching::Smart,
+                Normalization::Smart,
+                AtomKind::Fuzzy,
+                false,
+            );
+            for (index, item) in items.iter().enumerate() {
+                let subject = if item.filter.is_empty() { &item.label } else { &item.filter };
+                let haystack = Utf32Str::new(subject, &mut self.haystack);
+                if let Some(score) = atom.score(haystack, &mut self.matcher) {
+                    let kind = Kind::from_language(item.kind);
+                    self.ranked.push((u32::from(score) + kind.bonus(), index));
+                }
+            }
+        }
+        if self.ranked.is_empty() {
+            return;
+        }
+        self.ranked.sort_unstable_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| items[a.1].sort.cmp(&items[b.1].sort))
+                .then(a.1.cmp(&b.1))
+        });
+        self.ranked.truncate(MAX_ITEMS);
+
+        self.items.clear();
+        self.items.reserve(self.ranked.len());
+        for &(_, index) in &self.ranked {
+            let item = &items[index];
+            self.items.push(Candidate {
+                text: item.insert.clone(),
+                detail: item.detail.clone(),
+                kind: Kind::from_language(item.kind),
+            });
+        }
+        self.selected = 0;
+        self.scroll = 0;
+        self.source = Source::Language;
+        self.active = true;
     }
 
     fn build_pool(
@@ -211,6 +304,7 @@ impl Completion {
             if seen.insert(name.as_str()) {
                 self.pool.push(Candidate {
                     text: name.clone(),
+                    detail: String::new(),
                     kind: Kind::of(*kind),
                 });
             }
@@ -224,7 +318,11 @@ impl Completion {
             for (words, kind) in [(keywords, Kind::Keyword), (types, Kind::Type)] {
                 for word in words {
                     if seen.insert(word) {
-                        self.pool.push(Candidate { text: (*word).to_string(), kind });
+                        self.pool.push(Candidate {
+                            text: (*word).to_string(),
+                            detail: String::new(),
+                            kind,
+                        });
                     }
                 }
             }
@@ -247,7 +345,11 @@ impl Completion {
                 && word.chars().next().is_some_and(|c| !c.is_ascii_digit())
                 && seen.insert(word)
             {
-                self.pool.push(Candidate { text: word.to_string(), kind: Kind::Word });
+                self.pool.push(Candidate {
+                    text: word.to_string(),
+                    detail: String::new(),
+                    kind: Kind::Word,
+                });
                 words += 1;
             }
             start = end;
@@ -300,3 +402,105 @@ const CSHARP_TYPES: &[&str] = &[
     "Span", "Stack", "Stream", "String", "StringBuilder", "Task", "TimeSpan", "Tuple", "Type",
     "Uri", "ValueTask",
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lsp::protocol::CompletionItem;
+
+    fn item(label: &str, kind: u32, detail: &str, insert: &str, sort: &str) -> CompletionItem {
+        CompletionItem {
+            label: label.to_string(),
+            kind,
+            detail: detail.to_string(),
+            insert: insert.to_string(),
+            sort: sort.to_string(),
+            filter: label.to_string(),
+            edit: None,
+            documentation: String::new(),
+        }
+    }
+
+    #[test]
+    fn les_propositions_du_serveur_remplacent_les_locales() {
+        let mut buffer = TextBuffer::from_str("fn calculer_total() {}\nfn main() { calc }\n", None);
+        buffer.sync();
+        buffer.cursor_line = 1;
+        buffer.cursor_col = 16;
+        let mut completion = Completion::new();
+        completion.refresh(&buffer, Some(Language::Rust), None, MIN_PREFIX);
+        assert_eq!(completion.source(), Source::Local);
+        assert!(completion.active);
+
+        let items = vec![
+            item("calculer_total()", 3, "fn() -> u32", "calculer_total()", "aaa"),
+            item("calc_interne", 6, "u32", "calc_interne", "bbb"),
+            item("rien_a_voir", 6, "", "rien_a_voir", "ccc"),
+        ];
+        completion.set_language_items(&items, "calc");
+        assert_eq!(completion.source(), Source::Language);
+        assert_eq!(completion.items.len(), 2, "le candidat sans rapport est filtre");
+        assert_eq!(completion.items[0].text, "calculer_total()");
+        assert_eq!(completion.items[0].detail, "fn() -> u32");
+        assert_eq!(completion.items[0].kind, Kind::Function);
+        assert_eq!(completion.items[1].kind, Kind::Word);
+        assert_eq!(completion.prefix_chars, 4);
+        assert_eq!(completion.prefix(), "calc");
+    }
+
+    #[test]
+    fn prefixe_vide_garde_l_ordre_du_serveur() {
+        let mut completion = Completion::new();
+        let items = vec![
+            item("zzz", 5, "champ", "zzz", "b"),
+            item("aaa", 7, "classe", "aaa", "a"),
+        ];
+        completion.set_language_items(&items, "");
+        assert_eq!(completion.items.len(), 2);
+        assert_eq!(completion.items[0].text, "aaa", "sortText departage");
+        assert_eq!(completion.items[0].kind, Kind::Class);
+        assert_eq!(completion.items[1].kind, Kind::Word);
+        assert_eq!(completion.prefix_chars, 0);
+    }
+
+    #[test]
+    fn une_reponse_vide_laisse_les_propositions_locales() {
+        let mut buffer = TextBuffer::from_str("fn calculer() {}\nfn main() { calc }\n", None);
+        buffer.sync();
+        buffer.cursor_line = 1;
+        buffer.cursor_col = 16;
+        let mut completion = Completion::new();
+        completion.refresh(&buffer, Some(Language::Rust), None, MIN_PREFIX);
+        let avant = completion.items.len();
+        assert!(avant > 0);
+        completion.set_language_items(&[], "calc");
+        assert_eq!(completion.items.len(), avant);
+        assert_eq!(completion.source(), Source::Local);
+    }
+
+    #[test]
+    fn la_table_des_genres_couvre_le_contrat() {
+        assert_eq!(Kind::from_language(3), Kind::Function);
+        assert_eq!(Kind::from_language(5), Kind::Word);
+        assert_eq!(Kind::from_language(6), Kind::Word);
+        assert_eq!(Kind::from_language(7), Kind::Class);
+        assert_eq!(Kind::from_language(8), Kind::Interface);
+        assert_eq!(Kind::from_language(9), Kind::Module);
+        assert_eq!(Kind::from_language(10), Kind::Word);
+        assert_eq!(Kind::from_language(14), Kind::Keyword);
+        assert_eq!(Kind::from_language(22), Kind::Type);
+        assert_eq!(Kind::from_language(23), Kind::Method);
+        assert_eq!(Kind::from_language(25), Kind::Type);
+        assert_eq!(Kind::from_language(0), Kind::Word);
+    }
+
+    #[test]
+    fn le_rejet_revient_a_la_source_locale() {
+        let mut completion = Completion::new();
+        completion.set_language_items(&[item("abc", 3, "", "abc", "a")], "");
+        assert_eq!(completion.source(), Source::Language);
+        completion.dismiss();
+        assert_eq!(completion.source(), Source::Local);
+        assert!(!completion.active);
+    }
+}

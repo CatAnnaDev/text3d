@@ -13,8 +13,9 @@ struct Globals {
     params: vec4<f32>,
     shadow: vec4<f32>,
     find_anchor: vec4<f32>,
-    find_right: vec4<f32>,
-    find_up: vec4<f32>,
+    screen_right: vec4<f32>,
+    screen_up: vec4<f32>,
+    hud: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> g: Globals;
@@ -133,8 +134,8 @@ fn panel_vs(@location(0) position: vec3<f32>, @location(1) color: vec4<f32>) -> 
 
 @vertex
 fn find_panel_vs(@location(0) position: vec3<f32>, @location(1) color: vec4<f32>) -> PanelOut {
-    let right = g.find_right.xyz;
-    let up = g.find_up.xyz;
+    let right = g.screen_right.xyz;
+    let up = g.screen_up.xyz;
     let toward = cross(right, up);
     let world = g.find_anchor.xyz
         + (right * position.x + up * position.y + toward * position.z) * g.find_anchor.w;

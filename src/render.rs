@@ -11,7 +11,9 @@ use crate::camera::Camera;
 use crate::complete::{Completion, VISIBLE_ROWS};
 use crate::extrude::Vertex;
 use crate::font::Font;
+use crate::hud::{Hud, HudViewport, Label, Quad};
 use crate::layout::LineLayout;
+use crate::lsp::protocol::Severity;
 use crate::syntax::{Highlighter, STYLE_COLORS, STYLE_TEXT};
 use crate::text::{Match, TAB_WIDTH, TextBuffer};
 
@@ -29,6 +31,8 @@ const PANEL_FILL: [u8; 4] = [16, 19, 33, 242];
 const PANEL_EDGE: [u8; 4] = [70, 108, 150, 235];
 const PANEL_SELECTED: [u8; 4] = [58, 96, 140, 235];
 const TAG_COLOR: [u8; 4] = [110, 122, 150, 255];
+const DETAIL_COLOR: [u8; 4] = [122, 134, 158, 255];
+const DETAIL_MAX_CHARS: usize = 44;
 const TAG_COLUMNS: f32 = 4.4;
 
 const SHADOW_SIZE: u32 = 2048;
@@ -62,6 +66,34 @@ const FIND_VALUE_COLOR: [u8; 4] = [226, 234, 248, 255];
 const FIND_COUNT_COLOR: [u8; 4] = [196, 150, 52, 255];
 const FIND_CARET_WIDTH: f32 = 0.07;
 
+const HUD_EM_HEIGHT: f32 = 44.0;
+const HUD_LAYERS: usize = 8;
+const HUD_LAYER_STEP: f32 = 0.4;
+const HUD_TEXT_LIFT: f32 = 0.16;
+
+const GUTTER_GAP: f32 = 0.9;
+const GUTTER_MARK_GAP: f32 = 0.34;
+const GUTTER_MARK_WIDTH: f32 = 0.26;
+const GUTTER_MARK_HEIGHT: f32 = 0.62;
+const NUMBER_COLOR: [u8; 4] = [96, 108, 134, 255];
+const NUMBER_CURRENT_COLOR: [u8; 4] = [198, 212, 240, 255];
+
+const DIAGNOSTIC_TINT: u16 = 55;
+const MARK_LIFT: f32 = GLYPH_HALF_DEPTH + 0.015;
+const UNDERLINE_HEIGHT: f32 = 0.06;
+const UNDERLINE_DROP: f32 = 0.11;
+const UNDERLINE_MIN_WIDTH: f32 = 0.4;
+const UNDERLINE_ALPHA: u8 = 226;
+const SEVERITY_COLORS: [[u8; 4]; 4] = [
+    [236, 98, 92, 255],
+    [236, 176, 74, 255],
+    [96, 172, 236, 255],
+    [130, 150, 182, 255],
+];
+
+const FNV_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
 const INSTANCE_SIZE: u64 = std::mem::size_of::<Instance>() as u64;
 const PANEL_VERTEX_SIZE: u64 = std::mem::size_of::<PanelVertex>() as u64;
 
@@ -82,8 +114,9 @@ struct Globals {
     params: [f32; 4],
     shadow: [f32; 4],
     find_anchor: [f32; 4],
-    find_right: [f32; 4],
-    find_up: [f32; 4],
+    screen_right: [f32; 4],
+    screen_up: [f32; 4],
+    hud: [f32; 4],
 }
 
 #[repr(C)]
@@ -107,6 +140,20 @@ impl Instance {
 struct PanelVertex {
     position: [f32; 3],
     color: [u8; 4],
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct DiagnosticSpan {
+    pub line: usize,
+    pub start: usize,
+    pub end: usize,
+    pub severity: Severity,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct GutterMark {
+    pub line: usize,
+    pub severity: Severity,
 }
 
 pub struct FindBarView<'a> {
@@ -270,6 +317,75 @@ impl FlatInstances {
     }
 }
 
+struct HudRange {
+    slot: u32,
+    layer: u8,
+    start: u32,
+    end: u32,
+}
+
+struct LayeredText {
+    scratch: Vec<(u64, Instance)>,
+    values: Vec<Instance>,
+    ranges: Vec<HudRange>,
+    buffer: wgpu::Buffer,
+    capacity: u32,
+    triangles: u32,
+    label: &'static str,
+}
+
+impl LayeredText {
+    fn new(device: &wgpu::Device, label: &'static str) -> LayeredText {
+        LayeredText {
+            scratch: Vec::new(),
+            values: Vec::new(),
+            ranges: Vec::new(),
+            buffer: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: INSTANCE_SIZE * 64,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            capacity: 64,
+            triangles: 0,
+            label,
+        }
+    }
+
+    fn discard(&mut self) {
+        self.scratch.clear();
+        self.values.clear();
+        self.ranges.clear();
+        self.triangles = 0;
+    }
+
+    fn group(&mut self, slots: &[Slot]) {
+        self.triangles = group_hud_text(
+            &mut self.scratch,
+            slots,
+            &mut self.values,
+            &mut self.ranges,
+        );
+    }
+
+    fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        if self.values.is_empty() {
+            return;
+        }
+        let needed = self.values.len() as u32;
+        if needed > self.capacity {
+            self.capacity = needed.next_power_of_two();
+            self.buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(self.label),
+                size: u64::from(self.capacity) * INSTANCE_SIZE,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+        queue.write_buffer(&self.buffer, 0, bytemuck::cast_slice(&self.values));
+    }
+}
+
 struct PanelMesh {
     vertices: Vec<PanelVertex>,
     buffer: wgpu::Buffer,
@@ -367,6 +483,8 @@ pub struct Renderer {
     highlight_pipeline: wgpu::RenderPipeline,
     popup_pipeline: wgpu::RenderPipeline,
     find_pipeline: wgpu::RenderPipeline,
+    hud_quad_pipeline: wgpu::RenderPipeline,
+    hud_text_pipeline: wgpu::RenderPipeline,
     panel_pipeline: wgpu::RenderPipeline,
     find_panel_pipeline: wgpu::RenderPipeline,
     grid_pipeline: wgpu::RenderPipeline,
@@ -385,14 +503,28 @@ pub struct Renderer {
     popup_instances: InstanceSet,
     find_instances: InstanceSet,
     highlights: FlatInstances,
+    marks: FlatInstances,
+    hud_quads: FlatInstances,
+    hud_text: LayeredText,
 
     depth_view: wgpu::TextureView,
     msaa_view: Option<wgpu::TextureView>,
     shadow_view: wgpu::TextureView,
 
     layout: LineLayout,
+    number_layout: LineLayout,
+    number_text: String,
     lod_state: Vec<u8>,
     scratch_text: String,
+
+    diagnostics: Vec<DiagnosticSpan>,
+    gutter: Vec<GutterMark>,
+    hud_quad_layers: [u32; HUD_LAYERS + 1],
+    hud_key: u64,
+    diagnostics_key: u64,
+    gutter_key: u64,
+    line_numbers: bool,
+    wants_rebuild: bool,
 
     metrics: Metrics,
     cursor_y: f32,
@@ -656,6 +788,37 @@ impl Renderer {
             },
         );
 
+        let hud_quad_pipeline = make_glyph_pipeline(
+            &device,
+            &lit_layout,
+            &glyph_shader,
+            &glyph_buffers,
+            format,
+            multisample,
+            GlyphPass {
+                label: "hud-quad-pipeline",
+                vertex_entry: "vs_hud",
+                fragment_entry: "fs_hud_flat",
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                depth_write: false,
+            },
+        );
+        let hud_text_pipeline = make_glyph_pipeline(
+            &device,
+            &lit_layout,
+            &glyph_shader,
+            &glyph_buffers,
+            format,
+            multisample,
+            GlyphPass {
+                label: "hud-text-pipeline",
+                vertex_entry: "vs_hud",
+                fragment_entry: "fs_hud",
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                depth_write: true,
+            },
+        );
+
         let background_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("background-pipeline"),
             layout: Some(&lit_layout),
@@ -773,6 +936,9 @@ impl Renderer {
             popup_instances: InstanceSet::new(&device, "popup-instances"),
             find_instances: InstanceSet::new(&device, "find-instances"),
             highlights: FlatInstances::new(&device, "highlight-instances"),
+            marks: FlatInstances::new(&device, "mark-instances"),
+            hud_quads: FlatInstances::new(&device, "hud-quad-instances"),
+            hud_text: LayeredText::new(&device, "hud-text-instances"),
             popup_panel: PanelMesh::new(&device, "popup-panel"),
             find_panel: PanelMesh::new(&device, "find-panel"),
             surface,
@@ -788,6 +954,8 @@ impl Renderer {
             highlight_pipeline,
             popup_pipeline,
             find_pipeline,
+            hud_quad_pipeline,
+            hud_text_pipeline,
             panel_pipeline,
             find_panel_pipeline,
             grid_pipeline,
@@ -801,8 +969,18 @@ impl Renderer {
             msaa_view,
             shadow_view,
             layout: LineLayout::default(),
+            number_layout: LineLayout::default(),
+            number_text: String::new(),
             lod_state: Vec::new(),
             scratch_text: String::new(),
+            diagnostics: Vec::new(),
+            gutter: Vec::new(),
+            hud_quad_layers: [0; HUD_LAYERS + 1],
+            hud_key: 0,
+            diagnostics_key: 0,
+            gutter_key: 0,
+            line_numbers: true,
+            wants_rebuild: true,
             metrics: Metrics::of(font),
             cursor_y: 0.0,
             text_min: Vec3::splat(f32::INFINITY),
@@ -874,6 +1052,12 @@ impl Renderer {
         self.popup_instances.discard();
         self.find_instances.discard();
         self.highlights.values.clear();
+        self.marks.values.clear();
+        self.hud_quads.values.clear();
+        self.hud_text.discard();
+        self.hud_quad_layers = [0; HUD_LAYERS + 1];
+        self.hud_key = 0;
+        self.wants_rebuild = true;
         self.popup_panel.vertices.clear();
         self.find_panel.vertices.clear();
         self.lod_state.clear();
@@ -886,19 +1070,33 @@ impl Renderer {
         let quad = &self.atlas.slots[self.atlas.quad_slot() as usize];
         let cursor = &self.atlas.slots[self.atlas.cursor_slot as usize];
         let highlight_count = self.highlights.values.len() as u32;
+        let mark_count = self.marks.values.len() as u32;
+        let hud_quad_count = self.hud_quads.values.len() as u32;
+        let flat_count = highlight_count + mark_count + hud_quad_count;
         let instances = self.text_instances.values.len() as u32
             + self.popup_instances.values.len() as u32
             + self.find_instances.values.len() as u32
-            + highlight_count
+            + self.hud_text.values.len() as u32
+            + flat_count
             + 1;
         let triangles = self.text_instances.triangles
             + self.popup_instances.triangles
             + self.find_instances.triangles
-            + highlight_count * (quad.index_count / 3)
+            + self.hud_text.triangles
+            + flat_count * (quad.index_count / 3)
             + cursor.index_count / 3;
         let mut draws = 2 + self.text_instances.draws;
         draws += self.popup_instances.draws + self.find_instances.draws;
+        draws += self.hud_text.ranges.len() as u32;
+        for layer in 0..HUD_LAYERS {
+            if self.hud_quad_layers[layer] < self.hud_quad_layers[layer + 1] {
+                draws += 1;
+            }
+        }
         if highlight_count > 0 {
+            draws += 1;
+        }
+        if mark_count > 0 {
             draws += 1;
         }
         if self.grid_drawn {
@@ -926,12 +1124,16 @@ impl Renderer {
         camera: &Camera,
     ) {
         self.metrics = Metrics::of(font);
+        self.wants_rebuild = false;
         let line_height = self.metrics.line_height;
         let descender = self.metrics.descender;
-        let band_scale = self.metrics.band() / line_height;
+        let ascender = self.metrics.ascender;
+        let band = self.metrics.band();
+        let band_scale = band / line_height;
         let advance = self.metrics.advance;
         let eye = camera.eye();
         let depth_by_indent = self.depth_by_indent;
+        let numbered = self.line_numbers;
         let window = visible_lines(text);
 
         if self.lod_state.len() != text.line_count() {
@@ -940,6 +1142,29 @@ impl Renderer {
 
         self.text_instances.scratch.clear();
         self.highlights.values.clear();
+        self.marks.values.clear();
+
+        let number_right = -GUTTER_GAP;
+        let number_left = if numbered {
+            self.number_text.clear();
+            for _ in 0..digit_count(text.line_count()) {
+                self.number_text.push('0');
+            }
+            self.number_layout.build(font, &self.number_text);
+            number_right - self.number_layout.width
+        } else {
+            number_right
+        };
+        let bounds_left = if numbered { number_left } else { 0.0 };
+        let mark_x = number_left - GUTTER_MARK_GAP - GUTTER_MARK_WIDTH;
+        let mark_y = descender + (band - GUTTER_MARK_HEIGHT) * 0.5;
+        let mark_scale = GUTTER_MARK_HEIGHT / line_height;
+        let underline_scale = UNDERLINE_HEIGHT / line_height;
+
+        let mut gutter_cursor = self.gutter.partition_point(|mark| mark.line < window.start);
+        let mut span_cursor = self
+            .diagnostics
+            .partition_point(|span| span.line < window.start);
 
         let current: Option<Match> = text
             .current_match()
@@ -963,6 +1188,19 @@ impl Renderer {
             let lod = pick_lod(eye.distance(center), previous);
             self.lod_state[line_index] = lod;
 
+            while span_cursor < self.diagnostics.len()
+                && self.diagnostics[span_cursor].line < line_index
+            {
+                span_cursor += 1;
+            }
+            let span_start = span_cursor;
+            let mut span_end = span_cursor;
+            while span_end < self.diagnostics.len()
+                && self.diagnostics[span_end].line == line_index
+            {
+                span_end += 1;
+            }
+
             let line_start = text.line_start(line_index);
             for placement in &self.layout.placements {
                 let slot = self.atlas.slot_for(font, placement.key, lod);
@@ -973,23 +1211,85 @@ impl Renderer {
                     Some(highlighter) => highlighter.style_at(line_start + placement.byte),
                     None => plain_style(line[placement.byte..].chars().next().unwrap_or(' ')),
                 };
+                let mut color = STYLE_COLORS[style as usize];
+                if let Some(severity) =
+                    severity_at(&self.diagnostics[span_start..span_end], placement.column)
+                {
+                    color = tint_color(color, SEVERITY_COLORS[severity_slot(severity)]);
+                }
                 self.text_instances.scratch.push((
                     slot,
                     Instance {
                         offset: [placement.x, y, indent],
                         scale: [1.0, 1.0],
-                        color: STYLE_COLORS[style as usize],
+                        color,
                     },
                 ));
             }
 
-            if !self.layout.placements.is_empty() {
-                min.x = min.x.min(0.0);
+            if numbered {
+                self.number_text.clear();
+                let _ = write!(self.number_text, "{}", line_index + 1);
+                self.number_layout.build(font, &self.number_text);
+                let number_x = number_right - self.number_layout.width;
+                let color = if line_index == text.cursor_line {
+                    NUMBER_CURRENT_COLOR
+                } else {
+                    NUMBER_COLOR
+                };
+                for placement in &self.number_layout.placements {
+                    let slot = self.atlas.slot_for(font, placement.key, lod);
+                    if slot == BLANK {
+                        continue;
+                    }
+                    self.text_instances.scratch.push((
+                        slot,
+                        Instance {
+                            offset: [number_x + placement.x, y, indent],
+                            scale: [1.0, 1.0],
+                            color,
+                        },
+                    ));
+                }
+            }
+
+            if numbered || !self.layout.placements.is_empty() {
+                min.x = min.x.min(bounds_left);
                 max.x = max.x.max(self.layout.width);
                 min.y = min.y.min(y + descender);
-                max.y = max.y.max(y + self.metrics.ascender);
+                max.y = max.y.max(y + ascender);
                 min.z = min.z.min(indent - GLYPH_HALF_DEPTH);
                 max.z = max.z.max(indent + GLYPH_HALF_DEPTH + CURRENT_LINE_LIFT);
+            }
+
+            while gutter_cursor < self.gutter.len()
+                && self.gutter[gutter_cursor].line < line_index
+            {
+                gutter_cursor += 1;
+            }
+            if let Some(mark) = self.gutter.get(gutter_cursor)
+                && mark.line == line_index
+            {
+                self.marks.values.push(Instance {
+                    offset: [mark_x, y + mark_y, indent + MARK_LIFT],
+                    scale: [GUTTER_MARK_WIDTH, mark_scale],
+                    color: SEVERITY_COLORS[severity_slot(mark.severity)],
+                });
+            }
+
+            for span in &self.diagnostics[span_start..span_end] {
+                let (left, right) = span_bounds(&self.layout, span.start, span.end, advance);
+                let mut color = SEVERITY_COLORS[severity_slot(span.severity)];
+                color[3] = UNDERLINE_ALPHA;
+                push_span(
+                    &mut self.marks.values,
+                    left,
+                    right.max(left + UNDERLINE_MIN_WIDTH),
+                    y - UNDERLINE_DROP,
+                    indent + MARK_LIFT,
+                    underline_scale,
+                    color,
+                );
             }
 
             let quad_y = y + descender;
@@ -1001,7 +1301,7 @@ impl Renderer {
                     }
                     _ => MATCH_COLOR,
                 };
-                let (left, right) = self.span_x(found.start, found.end, advance);
+                let (left, right) = span_bounds(&self.layout, found.start, found.end, advance);
                 push_span(
                     &mut self.highlights.values,
                     left,
@@ -1013,7 +1313,7 @@ impl Renderer {
                 );
             }
             if let Some((start, end)) = text.selection_on_line(line_index) {
-                let (left, right) = self.span_x(start, end, advance);
+                let (left, right) = span_bounds(&self.layout, start, end, advance);
                 push_span(
                     &mut self.highlights.values,
                     left,
@@ -1033,6 +1333,7 @@ impl Renderer {
         self.upload_atlas();
         self.text_instances.upload(&self.device, &self.queue);
         self.highlights.upload(&self.device, &self.queue);
+        self.marks.upload(&self.device, &self.queue);
 
         let cursor_line = match text.lines.get(text.cursor_line) {
             Some(line) => line.as_str(),
@@ -1056,16 +1357,6 @@ impl Renderer {
         };
         self.queue
             .write_buffer(&self.cursor_buffer, 0, bytemuck::bytes_of(&cursor));
-    }
-
-    fn span_x(&self, start: usize, end: usize, advance: f32) -> (f32, f32) {
-        let count = self.layout.placements.len();
-        let left = self.layout.x_of_column(start);
-        let mut right = self.layout.x_of_column(end);
-        if end > count {
-            right += (end - count) as f32 * advance * 0.5;
-        }
-        (left, right)
     }
 
     pub fn set_popup(&mut self, completion: &Completion, text: &TextBuffer, font: &Font) {
@@ -1110,8 +1401,29 @@ impl Renderer {
             shown += 1;
         }
 
+        let detail_x = origin_x + TAG_COLUMNS * advance + widest + advance;
+        let mut detail_widest = 0.0f32;
+        for (row, candidate) in completion
+            .items
+            .iter()
+            .skip(completion.scroll)
+            .take(VISIBLE_ROWS)
+            .enumerate()
+        {
+            if candidate.detail.is_empty() {
+                continue;
+            }
+            let y = origin_y - row as f32 * line_height;
+            let detail = shorten(&candidate.detail, DETAIL_MAX_CHARS);
+            let width = self.push_popup_text(font, detail, detail_x, y, DETAIL_COLOR);
+            detail_widest = detail_widest.max(width);
+        }
+
         let left = origin_x - 0.3;
-        let right = origin_x + TAG_COLUMNS * advance + widest + 0.6 * advance;
+        let mut right = origin_x + TAG_COLUMNS * advance + widest + 0.6 * advance;
+        if detail_widest > 0.0 {
+            right = detail_x + detail_widest + 0.6 * advance;
+        }
         let top = origin_y + self.metrics.ascender * 0.85 + 0.14;
         let bottom = origin_y - (shown.saturating_sub(1)) as f32 * line_height
             + self.metrics.descender * 0.85
@@ -1257,6 +1569,93 @@ impl Renderer {
             ));
         }
         self.layout.width
+    }
+
+    pub fn hud_viewport(&self, camera: &Camera) -> HudViewport {
+        let aspect = self.aspect();
+        let (half_width, half_height) = camera.half_extent(aspect);
+        let ratio = if half_height > 1e-4 {
+            half_width / half_height
+        } else {
+            aspect
+        };
+        HudViewport {
+            width: HUD_EM_HEIGHT * ratio.max(0.01),
+            height: HUD_EM_HEIGHT,
+        }
+    }
+
+    pub fn line_numbers(&self) -> bool {
+        self.line_numbers
+    }
+
+    pub fn set_line_numbers(&mut self, enabled: bool) {
+        if self.line_numbers == enabled {
+            return;
+        }
+        self.line_numbers = enabled;
+        self.wants_rebuild = true;
+    }
+
+    pub fn wants_rebuild(&self) -> bool {
+        self.wants_rebuild
+    }
+
+    pub fn set_diagnostics(&mut self, spans: &[DiagnosticSpan]) {
+        let key = diagnostics_fingerprint(spans);
+        if key == self.diagnostics_key {
+            return;
+        }
+        self.diagnostics_key = key;
+        self.diagnostics.clear();
+        self.diagnostics.extend_from_slice(spans);
+        normalize_spans(&mut self.diagnostics);
+        self.wants_rebuild = true;
+    }
+
+    pub fn set_gutter(&mut self, marks: &[GutterMark]) {
+        let key = gutter_fingerprint(marks);
+        if key == self.gutter_key {
+            return;
+        }
+        self.gutter_key = key;
+        self.gutter.clear();
+        self.gutter.extend_from_slice(marks);
+        normalize_marks(&mut self.gutter);
+        self.wants_rebuild = true;
+    }
+
+    pub fn set_hud(&mut self, hud: &Hud, font: &Font) {
+        let quads = hud.quads();
+        let labels = hud.labels();
+        let key = hud_fingerprint(quads, labels);
+        if key == self.hud_key {
+            return;
+        }
+        self.hud_key = key;
+
+        build_hud_quads(
+            quads,
+            font.line_height(),
+            &mut self.hud_quads.values,
+            &mut self.hud_quad_layers,
+        );
+
+        self.hud_text.scratch.clear();
+        for label in labels {
+            push_hud_label(
+                &mut self.atlas,
+                &mut self.layout,
+                font,
+                label,
+                &mut self.hud_text.scratch,
+            );
+        }
+        self.hud_text.group(&self.atlas.slots);
+
+        self.upload_atlas();
+        self.hud_quads.upload(&self.device, &self.queue);
+        self.hud_text.upload(&self.device, &self.queue);
     }
 
     fn upload_atlas(&mut self) {
@@ -1579,6 +1978,12 @@ impl Renderer {
         let center = camera.target - camera.forward() * (camera.distance * FIND_PLANE);
         let anchor = center - right * (half_width * plane * 0.94) - up * (half_height * plane * 0.94);
         let find_scale = 2.0 * half_height * plane * FIND_TEXT_FRACTION / line_height;
+        let ratio = if half_height > 1e-4 {
+            half_width / half_height
+        } else {
+            aspect
+        };
+        let hud = hud_ndc(HUD_EM_HEIGHT * ratio.max(0.01), HUD_EM_HEIGHT);
 
         let globals = Globals {
             view_proj: camera.view_proj(aspect).to_cols_array_2d(),
@@ -1610,8 +2015,9 @@ impl Renderer {
                 0.0,
             ],
             find_anchor: [anchor.x, anchor.y, anchor.z, find_scale],
-            find_right: [right.x, right.y, right.z, 0.0],
-            find_up: [up.x, up.y, up.z, 0.0],
+            screen_right: [right.x, right.y, right.z, 0.0],
+            screen_up: [up.x, up.y, up.z, 0.0],
+            hud,
         };
         self.queue
             .write_buffer(&self.globals, 0, bytemuck::bytes_of(&globals));
@@ -1717,6 +2123,17 @@ impl Renderer {
                 0..1,
             );
 
+            if !self.marks.values.is_empty() {
+                let quad = &self.atlas.slots[self.atlas.quad_slot() as usize];
+                pass.set_pipeline(&self.highlight_pipeline);
+                pass.set_vertex_buffer(1, self.marks.buffer.slice(..));
+                pass.draw_indexed(
+                    quad.index_start..quad.index_start + quad.index_count,
+                    quad.base_vertex,
+                    0..self.marks.values.len() as u32,
+                );
+            }
+
             if !self.popup_instances.values.is_empty() {
                 pass.set_pipeline(&self.popup_pipeline);
                 pass.set_vertex_buffer(1, self.popup_instances.buffer.slice(..));
@@ -1748,6 +2165,54 @@ impl Renderer {
             pass.set_vertex_buffer(1, self.find_instances.buffer.slice(..));
             draw_groups(&mut pass, &self.atlas, &self.find_instances.offsets);
         }
+
+        self.encode_hud(&mut pass);
+    }
+
+    fn encode_hud(&self, pass: &mut wgpu::RenderPass<'_>) {
+        if self.atlas.indices.is_empty() {
+            return;
+        }
+        if self.hud_quads.values.is_empty() && self.hud_text.ranges.is_empty() {
+            return;
+        }
+
+        pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+        pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+        let quad = &self.atlas.slots[self.atlas.quad_slot() as usize];
+        let mut range = 0usize;
+
+        for layer in 0..HUD_LAYERS {
+            let start = self.hud_quad_layers[layer];
+            let end = self.hud_quad_layers[layer + 1];
+            if start < end {
+                pass.set_pipeline(&self.hud_quad_pipeline);
+                pass.set_vertex_buffer(1, self.hud_quads.buffer.slice(..));
+                pass.draw_indexed(
+                    quad.index_start..quad.index_start + quad.index_count,
+                    quad.base_vertex,
+                    start..end,
+                );
+            }
+
+            let first = range;
+            while range < self.hud_text.ranges.len()
+                && self.hud_text.ranges[range].layer as usize == layer
+            {
+                if range == first {
+                    pass.set_pipeline(&self.hud_text_pipeline);
+                    pass.set_vertex_buffer(1, self.hud_text.buffer.slice(..));
+                }
+                let entry = &self.hud_text.ranges[range];
+                let slot = &self.atlas.slots[entry.slot as usize];
+                pass.draw_indexed(
+                    slot.index_start..slot.index_start + slot.index_count,
+                    slot.base_vertex,
+                    entry.start..entry.end,
+                );
+                range += 1;
+            }
+        }
     }
 }
 
@@ -1776,6 +2241,267 @@ fn push_line(
         ));
     }
     layout.width
+}
+
+fn span_bounds(layout: &LineLayout, start: usize, end: usize, advance: f32) -> (f32, f32) {
+    let count = layout.placements.len();
+    let left = layout.x_of_column(start);
+    let mut right = layout.x_of_column(end);
+    if end > count {
+        right += (end - count) as f32 * advance * 0.5;
+    }
+    (left, right)
+}
+
+fn digit_count(value: usize) -> usize {
+    let mut count = 1usize;
+    let mut rest = value;
+    while rest >= 10 {
+        rest /= 10;
+        count += 1;
+    }
+    count
+}
+
+fn severity_slot(severity: Severity) -> usize {
+    match severity {
+        Severity::Error => 0,
+        Severity::Warning => 1,
+        Severity::Information => 2,
+        Severity::Hint => 3,
+    }
+}
+
+fn severity_at(spans: &[DiagnosticSpan], column: usize) -> Option<Severity> {
+    let mut best: Option<Severity> = None;
+    for span in spans {
+        if column < span.start || column >= span.end {
+            continue;
+        }
+        let keep = match best {
+            Some(current) => severity_slot(current) <= severity_slot(span.severity),
+            None => false,
+        };
+        if !keep {
+            best = Some(span.severity);
+        }
+    }
+    best
+}
+
+fn tint_color(base: [u8; 4], accent: [u8; 4]) -> [u8; 4] {
+    let blend = |left: u8, right: u8| -> u8 {
+        let value = u16::from(left) * (100 - DIAGNOSTIC_TINT) + u16::from(right) * DIAGNOSTIC_TINT;
+        ((value + 50) / 100) as u8
+    };
+    [
+        blend(base[0], accent[0]),
+        blend(base[1], accent[1]),
+        blend(base[2], accent[2]),
+        base[3],
+    ]
+}
+
+fn normalize_spans(spans: &mut [DiagnosticSpan]) {
+    for span in spans.iter_mut() {
+        if span.end < span.start {
+            span.end = span.start;
+        }
+    }
+    spans.sort_unstable_by(|left, right| {
+        left.line
+            .cmp(&right.line)
+            .then(left.start.cmp(&right.start))
+            .then(severity_slot(left.severity).cmp(&severity_slot(right.severity)))
+    });
+}
+
+fn normalize_marks(marks: &mut Vec<GutterMark>) {
+    marks.sort_unstable_by(|left, right| {
+        left.line
+            .cmp(&right.line)
+            .then(severity_slot(left.severity).cmp(&severity_slot(right.severity)))
+    });
+    marks.dedup_by_key(|mark| mark.line);
+}
+
+fn hud_ndc(width: f32, height: f32) -> [f32; 4] {
+    [
+        2.0 / width.max(1e-4),
+        -1.0,
+        2.0 / height.max(1e-4),
+        1.0,
+    ]
+}
+
+fn hud_layer(layer: u8) -> usize {
+    (layer as usize).min(HUD_LAYERS - 1)
+}
+
+fn hud_text_key(layer: usize, slot: u32) -> u64 {
+    ((layer as u64) << 32) | u64::from(slot)
+}
+
+fn hud_quad_instance(quad: &Quad, line_height: f32) -> Instance {
+    let layer = hud_layer(quad.layer);
+    let width = quad.rect.w.max(0.0);
+    let height = quad.rect.h.max(0.0);
+    Instance {
+        offset: [
+            quad.rect.x,
+            -(quad.rect.y + height),
+            layer as f32 * HUD_LAYER_STEP,
+        ],
+        scale: [width, height / line_height.max(1e-4)],
+        color: quad.color,
+    }
+}
+
+fn build_hud_quads(
+    quads: &[Quad],
+    line_height: f32,
+    out: &mut Vec<Instance>,
+    layers: &mut [u32; HUD_LAYERS + 1],
+) {
+    let mut counts = [0u32; HUD_LAYERS];
+    for quad in quads {
+        counts[hud_layer(quad.layer)] += 1;
+    }
+    layers[0] = 0;
+    for index in 0..HUD_LAYERS {
+        layers[index + 1] = layers[index] + counts[index];
+    }
+
+    out.clear();
+    out.resize(quads.len(), Instance::ZERO);
+    let mut cursors = [0u32; HUD_LAYERS];
+    cursors.copy_from_slice(&layers[..HUD_LAYERS]);
+    for quad in quads {
+        let layer = hud_layer(quad.layer);
+        let at = &mut cursors[layer];
+        out[*at as usize] = hud_quad_instance(quad, line_height);
+        *at += 1;
+    }
+}
+
+fn push_hud_label(
+    atlas: &mut GlyphAtlas,
+    layout: &mut LineLayout,
+    font: &Font,
+    label: &Label,
+    out: &mut Vec<(u64, Instance)>,
+) {
+    let layer = hud_layer(label.layer);
+    let z = layer as f32 * HUD_LAYER_STEP + HUD_TEXT_LIFT;
+    let baseline = -label.y;
+    layout.build(font, &label.text);
+    for placement in &layout.placements {
+        let slot = atlas.slot_for(font, placement.key, LOD_NEAR);
+        if slot == BLANK {
+            continue;
+        }
+        out.push((
+            hud_text_key(layer, slot),
+            Instance {
+                offset: [label.x + placement.x, baseline, z],
+                scale: [1.0, 1.0],
+                color: label.color,
+            },
+        ));
+    }
+}
+
+fn group_hud_text(
+    scratch: &mut [(u64, Instance)],
+    slots: &[Slot],
+    values: &mut Vec<Instance>,
+    ranges: &mut Vec<HudRange>,
+) -> u32 {
+    scratch.sort_unstable_by_key(|(key, _)| *key);
+    values.clear();
+    values.extend(scratch.iter().map(|(_, instance)| *instance));
+    ranges.clear();
+
+    let mut triangles = 0u32;
+    let mut index = 0usize;
+    while index < scratch.len() {
+        let key = scratch[index].0;
+        let start = index;
+        while index < scratch.len() && scratch[index].0 == key {
+            index += 1;
+        }
+        let slot = (key & 0xffff_ffff) as u32;
+        let count = (index - start) as u32;
+        if let Some(entry) = slots.get(slot as usize) {
+            triangles += count * (entry.index_count / 3);
+        }
+        ranges.push(HudRange {
+            slot,
+            layer: (key >> 32) as u8,
+            start: start as u32,
+            end: index as u32,
+        });
+    }
+    triangles
+}
+
+fn mix_bytes(hash: u64, bytes: &[u8]) -> u64 {
+    let mut hash = hash;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
+fn mix_f32(hash: u64, value: f32) -> u64 {
+    mix_bytes(hash, &value.to_bits().to_ne_bytes())
+}
+
+fn mix_usize(hash: u64, value: usize) -> u64 {
+    mix_bytes(hash, &(value as u64).to_ne_bytes())
+}
+
+fn hud_fingerprint(quads: &[Quad], labels: &[Label]) -> u64 {
+    let mut hash = mix_usize(FNV_BASIS, quads.len());
+    hash = mix_usize(hash, labels.len());
+    for quad in quads {
+        hash = mix_f32(hash, quad.rect.x);
+        hash = mix_f32(hash, quad.rect.y);
+        hash = mix_f32(hash, quad.rect.w);
+        hash = mix_f32(hash, quad.rect.h);
+        hash = mix_bytes(hash, &quad.color);
+        hash = mix_bytes(hash, &[quad.layer]);
+    }
+    for label in labels {
+        hash = mix_f32(hash, label.x);
+        hash = mix_f32(hash, label.y);
+        hash = mix_bytes(hash, &label.color);
+        hash = mix_bytes(hash, &[label.layer]);
+        hash = mix_bytes(hash, label.text.as_bytes());
+        hash = mix_bytes(hash, &[0]);
+    }
+    hash | 1
+}
+
+fn diagnostics_fingerprint(spans: &[DiagnosticSpan]) -> u64 {
+    let mut hash = mix_usize(FNV_BASIS, spans.len());
+    for span in spans {
+        hash = mix_usize(hash, span.line);
+        hash = mix_usize(hash, span.start);
+        hash = mix_usize(hash, span.end);
+        hash = mix_bytes(hash, &[severity_slot(span.severity) as u8]);
+    }
+    hash | 1
+}
+
+fn gutter_fingerprint(marks: &[GutterMark]) -> u64 {
+    let mut hash = mix_usize(FNV_BASIS, marks.len());
+    for mark in marks {
+        hash = mix_usize(hash, mark.line);
+        hash = mix_bytes(hash, &[severity_slot(mark.severity) as u8]);
+    }
+    hash | 1
 }
 
 fn push_span(
@@ -2100,4 +2826,312 @@ fn create_msaa(
             })
             .create_view(&Default::default()),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::font::GlyphKey;
+    use crate::hud::Rect;
+    use crate::layout::Placement;
+
+    fn quad_at(x: f32, y: f32, w: f32, h: f32, layer: u8) -> Quad {
+        Quad {
+            rect: Rect { x, y, w, h },
+            color: [1, 2, 3, 4],
+            layer,
+        }
+    }
+
+    fn label_at(x: f32, y: f32, text: &str, layer: u8) -> Label {
+        Label {
+            x,
+            y,
+            text: String::from(text),
+            color: [9, 8, 7, 255],
+            layer,
+        }
+    }
+
+    fn marked(x: f32) -> Instance {
+        Instance {
+            offset: [x, 0.0, 0.0],
+            scale: [1.0, 1.0],
+            color: [0, 0, 0, 255],
+        }
+    }
+
+    fn layout_of(advances: &[f32]) -> LineLayout {
+        let mut layout = LineLayout::default();
+        let mut x = 0.0;
+        for (column, advance) in advances.iter().enumerate() {
+            layout.placements.push(Placement {
+                key: GlyphKey { face: 0, gid: 0 },
+                x,
+                advance: *advance,
+                column,
+                byte: column,
+            });
+            x += *advance;
+        }
+        layout.width = x;
+        layout
+    }
+
+    #[test]
+    fn globals_suit_la_disposition_des_shaders() {
+        assert_eq!(std::mem::size_of::<Globals>(), 368);
+    }
+
+    #[test]
+    fn couche_hud_bornee() {
+        assert_eq!(hud_layer(0), 0);
+        assert_eq!(hud_layer(7), 7);
+        assert_eq!(hud_layer(200), HUD_LAYERS - 1);
+    }
+
+    #[test]
+    fn quad_hud_retourne_l_axe_vertical() {
+        let source = quad_at(3.0, 5.0, 10.0, 2.0, 2);
+        let instance = hud_quad_instance(&source, 1.25);
+        assert_eq!(instance.offset[0], 3.0);
+        assert_eq!(instance.offset[1], -7.0);
+        assert!((instance.offset[2] - 2.0 * HUD_LAYER_STEP).abs() < 1e-6);
+        assert_eq!(instance.scale[0], 10.0);
+        assert!((instance.scale[1] - 2.0 / 1.25).abs() < 1e-6);
+        assert_eq!(instance.color, [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn quad_hud_refuse_les_tailles_negatives() {
+        let instance = hud_quad_instance(&quad_at(0.0, 0.0, -3.0, -2.0, 0), 1.0);
+        assert_eq!(instance.scale, [0.0, 0.0]);
+    }
+
+    #[test]
+    fn quads_hud_groupes_par_couche() {
+        let quads = vec![
+            quad_at(0.0, 0.0, 1.0, 1.0, 3),
+            quad_at(1.0, 0.0, 1.0, 1.0, 0),
+            quad_at(2.0, 0.0, 1.0, 1.0, 3),
+            quad_at(3.0, 0.0, 1.0, 1.0, 1),
+        ];
+        let mut out = Vec::new();
+        let mut layers = [0u32; HUD_LAYERS + 1];
+        build_hud_quads(&quads, 1.0, &mut out, &mut layers);
+        assert_eq!(out.len(), 4);
+        assert_eq!(layers[0], 0);
+        assert_eq!(layers[1], 1);
+        assert_eq!(layers[2], 2);
+        assert_eq!(layers[3], 2);
+        assert_eq!(layers[4], 4);
+        assert_eq!(layers[HUD_LAYERS], 4);
+        assert_eq!(out[0].offset[0], 1.0);
+        assert_eq!(out[1].offset[0], 3.0);
+        assert_eq!(out[2].offset[0], 0.0);
+        assert_eq!(out[3].offset[0], 2.0);
+    }
+
+    #[test]
+    fn quads_hud_reutilisent_le_tampon() {
+        let mut out = Vec::new();
+        let mut layers = [0u32; HUD_LAYERS + 1];
+        let quads = vec![quad_at(0.0, 0.0, 1.0, 1.0, 0), quad_at(1.0, 0.0, 1.0, 1.0, 0)];
+        build_hud_quads(&quads, 1.0, &mut out, &mut layers);
+        let capacity = out.capacity();
+        build_hud_quads(&quads[..1], 1.0, &mut out, &mut layers);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out.capacity(), capacity);
+        assert_eq!(layers[HUD_LAYERS], 1);
+    }
+
+    #[test]
+    fn texte_hud_ordonne_par_couche_puis_par_slot() {
+        let slots = vec![
+            Slot { index_start: 0, index_count: 6, base_vertex: 0 },
+            Slot { index_start: 6, index_count: 6, base_vertex: 4 },
+        ];
+        let mut scratch = vec![
+            (hud_text_key(1, 1), marked(10.0)),
+            (hud_text_key(0, 1), marked(20.0)),
+            (hud_text_key(0, 0), marked(30.0)),
+            (hud_text_key(0, 1), marked(40.0)),
+        ];
+        let mut values = Vec::new();
+        let mut ranges = Vec::new();
+        let triangles = group_hud_text(&mut scratch, &slots, &mut values, &mut ranges);
+        assert_eq!(ranges.len(), 3);
+        assert_eq!((ranges[0].layer, ranges[0].slot, ranges[0].start, ranges[0].end), (0, 0, 0, 1));
+        assert_eq!((ranges[1].layer, ranges[1].slot, ranges[1].start, ranges[1].end), (0, 1, 1, 3));
+        assert_eq!((ranges[2].layer, ranges[2].slot, ranges[2].start, ranges[2].end), (1, 1, 3, 4));
+        assert_eq!(values.len(), 4);
+        assert_eq!(values[0].offset[0], 30.0);
+        assert_eq!(values[3].offset[0], 10.0);
+        assert_eq!(triangles, 8);
+    }
+
+    #[test]
+    fn empreinte_hud_stable_et_sensible() {
+        let quads = vec![quad_at(0.0, 0.0, 4.0, 2.0, 1)];
+        let labels = vec![label_at(1.0, 2.0, "onglets", 1)];
+        let base = hud_fingerprint(&quads, &labels);
+        assert_ne!(base, 0);
+        assert_eq!(base, hud_fingerprint(&quads, &labels));
+        assert_ne!(base, hud_fingerprint(&[quad_at(0.5, 0.0, 4.0, 2.0, 1)], &labels));
+        assert_ne!(base, hud_fingerprint(&[quad_at(0.0, 0.0, 4.0, 2.0, 2)], &labels));
+        assert_ne!(base, hud_fingerprint(&quads, &[label_at(1.0, 2.0, "onglet", 1)]));
+        assert_ne!(base, hud_fingerprint(&quads, &[label_at(1.0, 2.5, "onglets", 1)]));
+        assert_ne!(base, hud_fingerprint(&[], &labels));
+        assert_ne!(base, hud_fingerprint(&quads, &[]));
+        let recolore = Label {
+            x: 1.0,
+            y: 2.0,
+            text: String::from("onglets"),
+            color: [1, 1, 1, 255],
+            layer: 1,
+        };
+        assert_ne!(base, hud_fingerprint(&quads, &[recolore]));
+    }
+
+    #[test]
+    fn empreinte_hud_separe_les_libelles() {
+        let un = vec![label_at(0.0, 0.0, "ab", 0), label_at(0.0, 0.0, "c", 0)];
+        let deux = vec![label_at(0.0, 0.0, "a", 0), label_at(0.0, 0.0, "bc", 0)];
+        assert_ne!(hud_fingerprint(&[], &un), hud_fingerprint(&[], &deux));
+    }
+
+    #[test]
+    fn empreintes_de_diagnostics_distinguent_la_severite() {
+        let erreur = [DiagnosticSpan { line: 3, start: 1, end: 4, severity: Severity::Error }];
+        let alerte = [DiagnosticSpan { line: 3, start: 1, end: 4, severity: Severity::Warning }];
+        assert_ne!(diagnostics_fingerprint(&erreur), diagnostics_fingerprint(&alerte));
+        assert_eq!(diagnostics_fingerprint(&erreur), diagnostics_fingerprint(&erreur));
+        assert_ne!(diagnostics_fingerprint(&[]), 0);
+
+        let une = [GutterMark { line: 2, severity: Severity::Error }];
+        let autre = [GutterMark { line: 2, severity: Severity::Hint }];
+        assert_ne!(gutter_fingerprint(&une), gutter_fingerprint(&autre));
+        assert_ne!(gutter_fingerprint(&[]), 0);
+    }
+
+    #[test]
+    fn teinte_de_diagnostic_conserve_la_syntaxe() {
+        let melange = tint_color([200, 100, 0, 255], [0, 200, 100, 255]);
+        assert_eq!(melange, [90, 155, 55, 255]);
+        let sature = tint_color([255, 255, 255, 128], [255, 255, 255, 255]);
+        assert_eq!(sature, [255, 255, 255, 128]);
+    }
+
+    #[test]
+    fn severite_la_plus_grave_gagne() {
+        let spans = [
+            DiagnosticSpan { line: 4, start: 2, end: 8, severity: Severity::Warning },
+            DiagnosticSpan { line: 4, start: 4, end: 6, severity: Severity::Error },
+        ];
+        assert_eq!(severity_at(&spans, 1), None);
+        assert_eq!(severity_at(&spans, 2), Some(Severity::Warning));
+        assert_eq!(severity_at(&spans, 5), Some(Severity::Error));
+        assert_eq!(severity_at(&spans, 7), Some(Severity::Warning));
+        assert_eq!(severity_at(&spans, 8), None);
+        assert_eq!(severity_at(&[], 0), None);
+    }
+
+    #[test]
+    fn plage_vide_ne_teinte_aucun_glyphe() {
+        let spans = [DiagnosticSpan { line: 0, start: 3, end: 3, severity: Severity::Error }];
+        assert_eq!(severity_at(&spans, 2), None);
+        assert_eq!(severity_at(&spans, 3), None);
+    }
+
+    #[test]
+    fn spans_tries_et_bornes_redressees() {
+        let mut spans = vec![
+            DiagnosticSpan { line: 9, start: 1, end: 2, severity: Severity::Hint },
+            DiagnosticSpan { line: 2, start: 7, end: 9, severity: Severity::Warning },
+            DiagnosticSpan { line: 2, start: 4, end: 1, severity: Severity::Error },
+        ];
+        normalize_spans(&mut spans);
+        assert_eq!(spans[0].line, 2);
+        assert_eq!(spans[0].start, 4);
+        assert_eq!(spans[0].end, 4);
+        assert_eq!(spans[1].start, 7);
+        assert_eq!(spans[2].line, 9);
+    }
+
+    #[test]
+    fn marques_de_gouttiere_une_par_ligne() {
+        let mut marks = vec![
+            GutterMark { line: 5, severity: Severity::Warning },
+            GutterMark { line: 5, severity: Severity::Error },
+            GutterMark { line: 1, severity: Severity::Hint },
+            GutterMark { line: 1, severity: Severity::Information },
+        ];
+        normalize_marks(&mut marks);
+        assert_eq!(marks.len(), 2);
+        assert_eq!(marks[0].line, 1);
+        assert_eq!(marks[0].severity, Severity::Information);
+        assert_eq!(marks[1].line, 5);
+        assert_eq!(marks[1].severity, Severity::Error);
+    }
+
+    #[test]
+    fn compte_de_chiffres() {
+        assert_eq!(digit_count(0), 1);
+        assert_eq!(digit_count(9), 1);
+        assert_eq!(digit_count(10), 2);
+        assert_eq!(digit_count(999), 3);
+        assert_eq!(digit_count(1000), 4);
+        assert_eq!(digit_count(123456), 6);
+    }
+
+    #[test]
+    fn projection_hud_couvre_exactement_l_ecran() {
+        let ndc = hud_ndc(80.0, 40.0);
+        assert!((0.0 * ndc[0] + ndc[1] + 1.0).abs() < 1e-6);
+        assert!((80.0 * ndc[0] + ndc[1] - 1.0).abs() < 1e-6);
+        assert!((0.0 * ndc[2] + ndc[3] - 1.0).abs() < 1e-6);
+        assert!((-40.0 * ndc[2] + ndc[3] + 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn les_couches_hud_ne_se_chevauchent_pas_en_profondeur() {
+        let sommet = HUD_TEXT_LIFT + GLYPH_HALF_DEPTH;
+        assert!(sommet < HUD_LAYER_STEP);
+        assert!(HUD_TEXT_LIFT > 0.0);
+    }
+
+    #[test]
+    fn bornes_de_plage_suivent_la_fonte_proportionnelle() {
+        let layout = layout_of(&[0.4, 0.9, 0.5, 0.7]);
+        let (left, right) = span_bounds(&layout, 1, 3, 0.6);
+        assert!((left - 0.4).abs() < 1e-6);
+        assert!((right - 1.8).abs() < 1e-6);
+        let (debut, fin) = span_bounds(&layout, 0, 6, 0.6);
+        assert!((debut - 0.0).abs() < 1e-6);
+        assert!((fin - (2.5 + 2.0 * 0.6 * 0.5)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn bornes_de_plage_sur_ligne_vide() {
+        let layout = layout_of(&[]);
+        let (left, right) = span_bounds(&layout, 0, 0, 0.6);
+        assert_eq!(left, 0.0);
+        assert_eq!(right, 0.0);
+    }
+
+    #[test]
+    fn severites_couvrent_toute_la_table() {
+        assert_eq!(severity_slot(Severity::Error), 0);
+        assert_eq!(severity_slot(Severity::Warning), 1);
+        assert_eq!(severity_slot(Severity::Information), 2);
+        assert_eq!(severity_slot(Severity::Hint), 3);
+        assert_eq!(SEVERITY_COLORS.len(), 4);
+    }
+}
+
+fn shorten(text: &str, limit: usize) -> &str {
+    match text.char_indices().nth(limit) {
+        Some((at, _)) => &text[..at],
+        None => text,
+    }
 }

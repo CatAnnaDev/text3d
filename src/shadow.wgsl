@@ -13,8 +13,9 @@ struct Globals {
     params: vec4<f32>,
     shadow: vec4<f32>,
     find_anchor: vec4<f32>,
-    find_right: vec4<f32>,
-    find_up: vec4<f32>,
+    screen_right: vec4<f32>,
+    screen_up: vec4<f32>,
+    hud: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> g: Globals;
