@@ -5,12 +5,23 @@ mod export;
 mod extrude;
 mod font;
 mod history;
+#[allow(dead_code)]
+mod json;
 mod layout;
+#[allow(dead_code)]
+mod lsp;
 mod pick;
+#[allow(dead_code)]
+mod project;
 mod render;
+#[allow(dead_code)]
+mod search;
 mod syntax;
+#[allow(dead_code)]
+mod tasks;
 mod text;
-
+#[allow(dead_code)]
+mod workspace;
 #[cfg(test)]
 mod tests;
 
