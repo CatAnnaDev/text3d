@@ -16,9 +16,9 @@ pub const EDGE_COUNT: usize = 4;
 const HINT_HOLD: f32 = 2.0;
 const HINT_PEAK: f32 = 240.0;
 const HINT_STEP: u8 = 0xF0;
-const SUCCESS_COLOR: [u8; 3] = [126, 210, 160];
-const ERROR_COLOR: [u8; 3] = [232, 104, 104];
-const INFORMATION_COLOR: [u8; 3] = [102, 199, 245];
+const SUCCESS_COLOR: [u8; 3] = [53, 164, 90];
+const ERROR_COLOR: [u8; 3] = [206, 35, 35];
+const INFORMATION_COLOR: [u8; 3] = [34, 146, 233];
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Edge {
