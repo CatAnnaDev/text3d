@@ -2069,7 +2069,7 @@ impl Renderer {
             label: Some("main"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: color,
-                resolve_target: resolve,
+                resolve_target: None,
                 depth_slice: None,
                 ops: wgpu::Operations {
                     load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
@@ -2080,7 +2080,7 @@ impl Renderer {
                 view: &self.depth_view,
                 depth_ops: Some(wgpu::Operations {
                     load: wgpu::LoadOp::Clear(1.0),
-                    store: wgpu::StoreOp::Discard,
+                    store: wgpu::StoreOp::Store,
                 }),
                 stencil_ops: None,
             }),
@@ -2166,7 +2166,34 @@ impl Renderer {
             draw_groups(&mut pass, &self.atlas, &self.find_instances.offsets);
         }
 
-        self.encode_hud(&mut pass);
+        drop(pass);
+
+        let mut hud_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("hud"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: color,
+                resolve_target: resolve,
+                depth_slice: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &self.depth_view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: wgpu::StoreOp::Discard,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        hud_pass.set_bind_group(0, &self.bind_group, &[]);
+        hud_pass.set_bind_group(1, &self.shadow_bind_group, &[]);
+        self.encode_hud(&mut hud_pass);
     }
 
     fn encode_hud(&self, pass: &mut wgpu::RenderPass<'_>) {

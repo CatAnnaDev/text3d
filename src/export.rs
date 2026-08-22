@@ -167,7 +167,7 @@ fn write_obj_body<W: Write>(
         writeln!(out, "usemtl couleur{slot}")?;
         let start = group.start as usize;
         let end = start + group.count as usize;
-        for triangle in mesh.indices[start..end].chunks_exact(3) {
+        for triangle in mesh.indices[start..end].as_chunks::<3>().0 {
             let first = triangle[0] + 1;
             let second = triangle[1] + 1;
             let third = triangle[2] + 1;

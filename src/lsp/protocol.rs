@@ -210,13 +210,10 @@ pub fn path_from_uri(uri: &str) -> Option<PathBuf> {
     while index < source.len() {
         let byte = source[index];
         if byte == b'%' && index + 2 < source.len() {
-            match (hex_value(source[index + 1]), hex_value(source[index + 2])) {
-                (Some(high), Some(low)) => {
-                    decoded.push((high << 4) | low);
-                    index += 3;
-                    continue;
-                }
-                _ => {}
+            if let (Some(high), Some(low)) = (hex_value(source[index + 1]), hex_value(source[index + 2])) {
+                decoded.push((high << 4) | low);
+                index += 3;
+                continue;
             }
         }
         decoded.push(byte);
@@ -376,8 +373,8 @@ fn push_location(value: &Json, out: &mut Vec<Location>) {
         }
         return;
     }
-    if let Some(uri) = value.get("targetUri").and_then(Json::as_str) {
-        if let Some(path) = path_from_uri(uri) {
+    if let Some(uri) = value.get("targetUri").and_then(Json::as_str)
+        && let Some(path) = path_from_uri(uri) {
             let range = value
                 .get("targetSelectionRange")
                 .and_then(range_from_json)
@@ -385,7 +382,6 @@ fn push_location(value: &Json, out: &mut Vec<Location>) {
                 .unwrap_or(Range::zero());
             out.push(Location { path, range });
         }
-    }
 }
 
 pub fn parse_locations(value: &Json, out: &mut Vec<Location>) {

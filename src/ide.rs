@@ -1041,7 +1041,7 @@ impl Ide {
         let Some(slot) = self.ensure_session(&path) else {
             return;
         };
-        if self.sessions[slot].docs.iter().any(|doc| *doc == path) {
+        if self.sessions[slot].docs.contains(&path) {
             return;
         }
         let mut text = std::mem::take(&mut self.text);

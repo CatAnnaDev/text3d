@@ -8,7 +8,7 @@ use crate::text::Cursor;
 use crate::workspace::Tab;
 use std::fmt::Write;
 
-pub const CHAR_WIDTH: f32 = 0.55;
+pub const CHAR_WIDTH: f32 = 0.6;
 pub const TAB_BAR_HEIGHT: f32 = 1.8;
 pub const SIDEBAR_WIDTH: f32 = 26.0;
 pub const STATUS_HEIGHT: f32 = 1.5;
@@ -53,20 +53,20 @@ const LAYER_CARD_TEXT: u8 = 3;
 const LAYER_PANEL: u8 = 4;
 const LAYER_PANEL_TEXT: u8 = 5;
 
-const BAR_FILL: [u8; 4] = [17, 21, 36, 236];
-const BAR_EDGE: [u8; 4] = [54, 70, 104, 220];
-const SIDEBAR_FILL: [u8; 4] = [14, 18, 31, 232];
-const TAB_FILL: [u8; 4] = [22, 27, 45, 236];
-const TAB_ACTIVE_FILL: [u8; 4] = [34, 44, 70, 244];
-const TAB_ACCENT: [u8; 4] = [102, 199, 245, 255];
-const PANEL_FILL: [u8; 4] = [16, 19, 33, 246];
-const PANEL_EDGE: [u8; 4] = [70, 108, 150, 235];
-const PANEL_SELECTED: [u8; 4] = [58, 96, 140, 235];
-const CARD_FILL: [u8; 4] = [20, 24, 40, 244];
-const CARD_EDGE: [u8; 4] = [64, 92, 132, 230];
+const BAR_FILL: [u8; 4] = [1, 2, 4, 250];
+const BAR_EDGE: [u8; 4] = [9, 16, 35, 220];
+const SIDEBAR_FILL: [u8; 4] = [1, 2, 3, 244];
+const TAB_FILL: [u8; 4] = [2, 3, 7, 236];
+const TAB_ACTIVE_FILL: [u8; 4] = [4, 6, 16, 244];
+const TAB_ACCENT: [u8; 4] = [34, 146, 233, 255];
+const PANEL_FILL: [u8; 4] = [1, 2, 4, 252];
+const PANEL_EDGE: [u8; 4] = [16, 38, 78, 235];
+const PANEL_SELECTED: [u8; 4] = [11, 30, 67, 235];
+const CARD_FILL: [u8; 4] = [2, 2, 5, 250];
+const CARD_EDGE: [u8; 4] = [13, 27, 59, 230];
 const TEXT_MAIN: [u8; 4] = [226, 234, 248, 255];
-const TEXT_DIM: [u8; 4] = [132, 148, 180, 255];
-const TEXT_FAINT: [u8; 4] = [98, 112, 142, 255];
+const TEXT_DIM: [u8; 4] = [84, 96, 122, 255];
+const TEXT_FAINT: [u8; 4] = [47, 55, 74, 255];
 const TEXT_ACCENT: [u8; 4] = [102, 199, 245, 255];
 const DIR_COLOR: [u8; 4] = [156, 190, 232, 255];
 const MODIFIED_COLOR: [u8; 4] = [235, 178, 84, 255];
@@ -76,9 +76,9 @@ const RUNNING_COLOR: [u8; 4] = [126, 210, 160, 255];
 const STDERR_COLOR: [u8; 4] = [228, 148, 128, 255];
 const STDOUT_COLOR: [u8; 4] = [198, 208, 228, 255];
 const CARET_COLOR: [u8; 4] = [255, 194, 102, 255];
-const SCROLLBAR_TRACK: [u8; 4] = [24, 30, 48, 200];
-const SCROLLBAR_THUMB: [u8; 4] = [78, 100, 140, 220];
-const SELECTED_ROW: [u8; 4] = [40, 58, 92, 220];
+const SCROLLBAR_TRACK: [u8; 4] = [2, 3, 8, 200];
+const SCROLLBAR_THUMB: [u8; 4] = [19, 32, 67, 220];
+const SELECTED_ROW: [u8; 4] = [5, 11, 27, 220];
 
 pub struct HudViewport {
     pub width: f32,
@@ -569,92 +569,6 @@ impl Hud {
             LAYER_BAR,
         );
         let baseline = baseline_of(bar);
-        let mut x = STATUS_PAD;
-
-        x += self.push_label(
-            x,
-            baseline,
-            TEXT_ACCENT,
-            LAYER_BAR_TEXT,
-            model.project.label(),
-        ) + STATUS_GAP;
-        x += self.push_label(
-            x,
-            baseline,
-            TEXT_FAINT,
-            LAYER_BAR_TEXT,
-            model.project.kind().label(),
-        ) + STATUS_GAP;
-        let language = match model.language {
-            Some(language) => language.label(),
-            None => "texte",
-        };
-        x += self.push_label(x, baseline, TEXT_DIM, LAYER_BAR_TEXT, language) + STATUS_GAP;
-
-        let server_width =
-            self.push_label(x, baseline, TEXT_DIM, LAYER_BAR_TEXT, model.server_status);
-        self.push_hit(
-            Rect::new(
-                x - STATUS_GAP * 0.5,
-                top,
-                server_width + STATUS_GAP,
-                STATUS_HEIGHT,
-            ),
-            Target::StatusServer,
-        );
-        x += server_width + STATUS_GAP;
-
-        let (errors, warnings) = model.diagnostics;
-        self.scratch.clear();
-        let _ = write!(
-            self.scratch,
-            "{} erreurs  {} avertissements",
-            errors, warnings
-        );
-        let color = if errors > 0 {
-            ERROR_COLOR
-        } else if warnings > 0 {
-            WARNING_COLOR
-        } else {
-            TEXT_FAINT
-        };
-        let diagnostics_width = self.emit_scratch(x, baseline, color, LAYER_BAR_TEXT);
-        self.push_hit(
-            Rect::new(
-                x - STATUS_GAP * 0.5,
-                top,
-                diagnostics_width + STATUS_GAP,
-                STATUS_HEIGHT,
-            ),
-            Target::StatusDiagnostics,
-        );
-        x += diagnostics_width + STATUS_GAP;
-
-        if model.tasks.running() {
-            self.scratch.clear();
-            let _ = write!(self.scratch, "tache: {}", model.tasks.label());
-            x += self.emit_scratch(x, baseline, RUNNING_COLOR, LAYER_BAR_TEXT) + STATUS_GAP;
-        } else if let Some(code) = model.tasks.exit_code() {
-            self.scratch.clear();
-            if code == 0 {
-                let _ = write!(self.scratch, "{}: ok", model.tasks.label());
-            } else {
-                let _ = write!(self.scratch, "{}: echec {}", model.tasks.label(), code);
-            }
-            let color = if code == 0 {
-                RUNNING_COLOR
-            } else {
-                ERROR_COLOR
-            };
-            x += self.emit_scratch(x, baseline, color, LAYER_BAR_TEXT) + STATUS_GAP;
-        }
-
-        if model.search.running() {
-            let (done, total) = model.search.progress();
-            self.scratch.clear();
-            let _ = write!(self.scratch, "recherche {}/{}", done, total);
-            let _ = self.emit_scratch(x, baseline, TEXT_DIM, LAYER_BAR_TEXT);
-        }
 
         let mut right = width - STATUS_PAD;
         let font_width = model.font_name.chars().count() as f32 * CHAR_WIDTH;
@@ -678,6 +592,118 @@ impl Hud {
         let cursor_width = self.scratch.chars().count() as f32 * CHAR_WIDTH;
         if cursor_width < right {
             self.emit_scratch(right - cursor_width, baseline, TEXT_DIM, LAYER_BAR_TEXT);
+            right -= cursor_width + STATUS_GAP;
+        }
+
+        let limit = right;
+        let mut x = STATUS_PAD;
+
+        if !fits(x, model.project.label(), limit) {
+            return;
+        }
+        x += self.push_label(
+            x,
+            baseline,
+            TEXT_ACCENT,
+            LAYER_BAR_TEXT,
+            model.project.label(),
+        ) + STATUS_GAP;
+
+        let language = match model.language {
+            Some(language) => language.label(),
+            None => "texte",
+        };
+        let kind = model.project.kind().label();
+        if kind != language {
+            if !fits(x, kind, limit) {
+                return;
+            }
+            x += self.push_label(x, baseline, TEXT_FAINT, LAYER_BAR_TEXT, kind) + STATUS_GAP;
+        }
+
+        if !fits(x, language, limit) {
+            return;
+        }
+        x += self.push_label(x, baseline, TEXT_DIM, LAYER_BAR_TEXT, language) + STATUS_GAP;
+
+        if !fits(x, model.server_status, limit) {
+            return;
+        }
+        let server_width =
+            self.push_label(x, baseline, TEXT_DIM, LAYER_BAR_TEXT, model.server_status);
+        self.push_hit(
+            Rect::new(
+                x - STATUS_GAP * 0.5,
+                top,
+                server_width + STATUS_GAP,
+                STATUS_HEIGHT,
+            ),
+            Target::StatusServer,
+        );
+        x += server_width + STATUS_GAP;
+
+        let (errors, warnings) = model.diagnostics;
+        self.scratch.clear();
+        let _ = write!(
+            self.scratch,
+            "{} erreurs  {} avertissements",
+            errors, warnings
+        );
+        if !fits_scratch(x, &self.scratch, limit) {
+            return;
+        }
+        let color = if errors > 0 {
+            ERROR_COLOR
+        } else if warnings > 0 {
+            WARNING_COLOR
+        } else {
+            TEXT_FAINT
+        };
+        let diagnostics_width = self.emit_scratch(x, baseline, color, LAYER_BAR_TEXT);
+        self.push_hit(
+            Rect::new(
+                x - STATUS_GAP * 0.5,
+                top,
+                diagnostics_width + STATUS_GAP,
+                STATUS_HEIGHT,
+            ),
+            Target::StatusDiagnostics,
+        );
+        x += diagnostics_width + STATUS_GAP;
+
+        if model.tasks.running() {
+            self.scratch.clear();
+            let _ = write!(self.scratch, "tache: {}", model.tasks.label());
+            if !fits_scratch(x, &self.scratch, limit) {
+                return;
+            }
+            x += self.emit_scratch(x, baseline, RUNNING_COLOR, LAYER_BAR_TEXT) + STATUS_GAP;
+        } else if let Some(code) = model.tasks.exit_code() {
+            self.scratch.clear();
+            if code == 0 {
+                let _ = write!(self.scratch, "{}: ok", model.tasks.label());
+            } else {
+                let _ = write!(self.scratch, "{}: echec {}", model.tasks.label(), code);
+            }
+            if !fits_scratch(x, &self.scratch, limit) {
+                return;
+            }
+            let color = if code == 0 {
+                RUNNING_COLOR
+            } else {
+                ERROR_COLOR
+            };
+            x += self.emit_scratch(x, baseline, color, LAYER_BAR_TEXT) + STATUS_GAP;
+        }
+
+        if model.search.running() {
+            let (done, total) = model.search.progress();
+            self.scratch.clear();
+            let _ = write!(self.scratch, "recherche {}/{}", done, total);
+            if !fits_scratch(x, &self.scratch, limit) {
+                return;
+            }
+            let _ = self.emit_scratch(x, baseline, TEXT_DIM, LAYER_BAR_TEXT);
         }
     }
 
@@ -1126,6 +1152,14 @@ fn output_window(total: usize, visible: usize, from_top: usize) -> usize {
 fn tab_span(name: &str) -> f32 {
     let shown = name.chars().count().min(TAB_NAME_MAX) as f32;
     TAB_PAD + shown * CHAR_WIDTH + TAB_GAP + TAB_MODIFIED_WIDTH + TAB_CLOSE_WIDTH + TAB_PAD
+}
+
+fn fits(x: f32, text: &str, limit: f32) -> bool {
+    x + text.chars().count() as f32 * CHAR_WIDTH <= limit
+}
+
+fn fits_scratch(x: f32, scratch: &str, limit: f32) -> bool {
+    fits(x, scratch, limit)
 }
 
 fn baseline_of(rect: Rect) -> f32 {

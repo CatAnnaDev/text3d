@@ -608,11 +608,10 @@ impl Server {
             self.queued.push(self.payload.clone());
             return;
         }
-        if let Err(error) = self.transport.send(&self.payload) {
-            if self.failure.is_none() {
+        if let Err(error) = self.transport.send(&self.payload)
+            && self.failure.is_none() {
                 self.failure = Some(error);
             }
-        }
     }
 
     fn send_cancel(&mut self, id: u64) {
@@ -683,11 +682,10 @@ impl Server {
                 .push_str(",\"error\":{\"code\":-32601,\"message\":\"methode non prise en charge\"}"),
         }
         self.payload.push('}');
-        if let Err(error) = self.transport.send(&self.payload) {
-            if self.failure.is_none() {
+        if let Err(error) = self.transport.send(&self.payload)
+            && self.failure.is_none() {
                 self.failure = Some(error);
             }
-        }
     }
 
     fn notify(&mut self, method: &str, message: &Json, out: &mut Vec<Event>) {
@@ -975,7 +973,7 @@ fn runnable(path: &Path) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        return data.permissions().mode() & 0o111 != 0;
+        data.permissions().mode() & 0o111 != 0
     }
     #[cfg(not(unix))]
     {
