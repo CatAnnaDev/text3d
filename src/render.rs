@@ -27,9 +27,9 @@ const ACCENT: [f32; 4] = [0.40, 0.78, 0.96, 1.0];
 const HIGHLIGHT: [f32; 4] = [1.0, 0.76, 0.40, 1.0];
 
 const POPUP_Z: f32 = 1.1;
-const PANEL_FILL: [u8; 4] = [16, 19, 33, 242];
-const PANEL_EDGE: [u8; 4] = [70, 108, 150, 235];
-const PANEL_SELECTED: [u8; 4] = [58, 96, 140, 235];
+const PANEL_FILL: [u8; 4] = [1, 2, 4, 255];
+const PANEL_EDGE: [u8; 4] = [16, 38, 78, 235];
+const PANEL_SELECTED: [u8; 4] = [11, 30, 67, 235];
 const TAG_COLOR: [u8; 4] = [110, 122, 150, 255];
 const DETAIL_COLOR: [u8; 4] = [122, 134, 158, 255];
 const DETAIL_MAX_CHARS: usize = 44;
@@ -2069,7 +2069,7 @@ impl Renderer {
             label: Some("main"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: color,
-                resolve_target: None,
+                resolve_target: resolve,
                 depth_slice: None,
                 ops: wgpu::Operations {
                     load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
@@ -2080,7 +2080,7 @@ impl Renderer {
                 view: &self.depth_view,
                 depth_ops: Some(wgpu::Operations {
                     load: wgpu::LoadOp::Clear(1.0),
-                    store: wgpu::StoreOp::Store,
+                    store: wgpu::StoreOp::Discard,
                 }),
                 stencil_ops: None,
             }),
@@ -2166,34 +2166,7 @@ impl Renderer {
             draw_groups(&mut pass, &self.atlas, &self.find_instances.offsets);
         }
 
-        drop(pass);
-
-        let mut hud_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("hud"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: color,
-                resolve_target: resolve,
-                depth_slice: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Load,
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                view: &self.depth_view,
-                depth_ops: Some(wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(1.0),
-                    store: wgpu::StoreOp::Discard,
-                }),
-                stencil_ops: None,
-            }),
-            timestamp_writes: None,
-            occlusion_query_set: None,
-            multiview_mask: None,
-        });
-        hud_pass.set_bind_group(0, &self.bind_group, &[]);
-        hud_pass.set_bind_group(1, &self.shadow_bind_group, &[]);
-        self.encode_hud(&mut hud_pass);
+        self.encode_hud(&mut pass);
     }
 
     fn encode_hud(&self, pass: &mut wgpu::RenderPass<'_>) {
