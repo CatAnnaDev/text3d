@@ -2,6 +2,7 @@ mod atlas;
 mod camera;
 mod commands;
 mod complete;
+mod demo;
 mod export;
 mod extrude;
 mod font;
@@ -262,6 +263,11 @@ struct EditorFrame {
 }
 
 struct App {
+    wall_frame: Instant,
+    beat_clock: f32,
+    demo: Option<demo::Demo>,
+    recorder: Option<demo::Recorder>,
+    beats: Vec<demo::Action>,
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
     font: Font,
@@ -324,6 +330,11 @@ impl App {
     fn new(font: Font, ide: Ide) -> App {
         let now = Instant::now();
         App {
+            wall_frame: now,
+            beat_clock: 0.0,
+            demo: None,
+            recorder: None,
+            beats: Vec::new(),
             window: None,
             renderer: None,
             font,
@@ -2778,14 +2789,30 @@ impl App {
         commands::execute(self, command, event_loop);
     }
 
-    fn frame(&mut self) {
+    fn frame(&mut self, event_loop: &ActiveEventLoop) {
         let now = Instant::now();
-        let dt = (now - self.last_frame).as_secs_f32().min(0.1);
+        let scripted = self.demo.is_some();
+        let dt = if scripted {
+            demo::FRAME_STEP
+        } else {
+            (now - self.last_frame).as_secs_f32().min(0.1)
+        };
         self.last_frame = now;
-        let elapsed = (now - self.start).as_secs_f32();
+        let elapsed = if scripted {
+            self.beat_clock += dt;
+            self.beat_clock
+        } else {
+            (now - self.start).as_secs_f32()
+        };
 
         if self.renderer.is_none() {
             return;
+        }
+
+        if scripted {
+            let real_dt = (now - self.wall_frame).as_secs_f32().min(0.5);
+            self.wall_frame = now;
+            self.drive_demo(event_loop, real_dt);
         }
 
         self.poll_folder();
@@ -2879,6 +2906,132 @@ impl App {
             && self.status != err
         {
             self.set_status(err);
+        }
+
+        if self.recorder.is_some() {
+            self.record_frame(elapsed);
+        }
+    }
+
+    fn drive_demo(&mut self, event_loop: &ActiveEventLoop, real_dt: f32) {
+        let ready = self.ide.server_ready();
+        let mut beats = std::mem::take(&mut self.beats);
+        let done = match self.demo.as_mut() {
+            Some(script) => {
+                script.advance(ready, real_dt, &mut beats);
+                script.finished()
+            }
+            None => true,
+        };
+        for action in beats.drain(..) {
+            self.play(action, event_loop);
+        }
+        self.beats = beats;
+        if done {
+            self.close_demo();
+            event_loop.exit();
+        }
+    }
+
+    fn play(&mut self, action: demo::Action, event_loop: &ActiveEventLoop) {
+        match action {
+            demo::Action::Type(ch) => self.demo_type(ch),
+            demo::Action::Press(key) => self.demo_press(key),
+            demo::Action::Run(command) => commands::execute(self, command, event_loop),
+            demo::Action::Aim(surface) => self.aim_at(surface),
+            demo::Action::Place(line, column) => {
+                self.ide
+                    .workspace_mut()
+                    .buffer_mut()
+                    .set_cursor(Cursor { line, column }, false);
+                self.refresh_view();
+            }
+            demo::Action::Orbit(dx, dy) => {
+                self.camera.release();
+                self.camera.orbit(dx, dy);
+            }
+            demo::Action::Zoom(amount) => {
+                self.camera.release();
+                self.camera.zoom(amount);
+            }
+        }
+    }
+
+    fn demo_type(&mut self, ch: char) {
+        if self.overlay.is_capturing_input() {
+            self.overlay.insert(ch);
+            self.on_query_changed();
+            return;
+        }
+        let previous = self.previous_char();
+        self.ide.workspace_mut().buffer_mut().insert_char(ch);
+        self.after_edit();
+        self.update_completion(false);
+        self.ask_language_completion(previous, ch);
+    }
+
+    fn demo_press(&mut self, key: demo::Key) {
+        match key {
+            demo::Key::Enter => {
+                if self.overlay.is_capturing_input() {
+                    self.accept_panel();
+                } else if self.completion.active {
+                    self.accept_completion();
+                } else {
+                    self.ide.workspace_mut().buffer_mut().insert_newline();
+                    self.after_edit();
+                    self.close_popup();
+                }
+            }
+            demo::Key::Escape => {
+                if self.overlay.is_capturing_input() {
+                    self.close_panel();
+                } else {
+                    self.close_popup();
+                }
+            }
+            demo::Key::Tab => {
+                if self.overlay.is_capturing_input() {
+                    self.overlay.move_selection(1);
+                } else if self.completion.active {
+                    self.accept_completion();
+                }
+            }
+        }
+    }
+
+    fn record_frame(&mut self, elapsed: f32) {
+        if self.demo.as_ref().is_some_and(demo::Demo::holding) {
+            return;
+        }
+        let wave = self.wave;
+        let grid = self.grid;
+        let shot = match self.renderer.as_mut() {
+            Some(renderer) => renderer.capture(&self.camera, elapsed, wave, grid),
+            None => return,
+        };
+        let (width, height, pixels) = match shot {
+            Ok(shot) => shot,
+            Err(err) => {
+                eprintln!("capture de frame: {err}");
+                self.recorder = None;
+                return;
+            }
+        };
+        if let Some(recorder) = self.recorder.as_mut()
+            && let Err(err) = recorder.push(width, height, &pixels)
+        {
+            eprintln!("enregistrement: {err}");
+            self.recorder = None;
+        }
+    }
+
+    fn close_demo(&mut self) {
+        if let Some(recorder) = self.recorder.take() {
+            match recorder.finish() {
+                Ok(note) => println!("{note}"),
+                Err(err) => eprintln!("{err}"),
+            }
         }
     }
 }
@@ -3085,7 +3238,7 @@ impl App {
                 };
                 self.wheel(amount);
             }
-            WindowEvent::RedrawRequested => self.frame(),
+            WindowEvent::RedrawRequested => self.frame(event_loop),
             _ => {}
         }
     }
@@ -3127,8 +3280,30 @@ fn keep_within(value: f32, target: f32, reach: f32) -> f32 {
     value.clamp(low.min(high), high.max(low))
 }
 
-fn startup() -> (Project, Workspace, Option<PathBuf>) {
-    let argument = std::env::args_os().nth(1).map(PathBuf::from);
+struct Invocation {
+    file: Option<PathBuf>,
+    demo: bool,
+    record: Option<PathBuf>,
+}
+
+fn invocation() -> Invocation {
+    let mut call = Invocation { file: None, demo: false, record: None };
+    let mut args = std::env::args_os().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.to_str() {
+            Some("--demo") => call.demo = true,
+            Some("--record") => call.record = args.next().map(PathBuf::from),
+            _ if call.file.is_none() => call.file = Some(PathBuf::from(arg)),
+            _ => {}
+        }
+    }
+    if call.record.is_some() {
+        call.demo = true;
+    }
+    call
+}
+
+fn startup(argument: Option<PathBuf>) -> (Project, Workspace, Option<PathBuf>) {
     let Some(argument) = argument else {
         let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let project = Project::open(&root);
@@ -3153,7 +3328,8 @@ fn main() {
         }
     };
 
-    let (project, workspace, file) = startup();
+    let call = invocation();
+    let (project, workspace, file) = startup(call.file.clone());
     let mut ide = Ide::new(project, workspace);
     let mut opening = None;
     if let Some(file) = file
@@ -3171,6 +3347,18 @@ fn main() {
     };
     event_loop.set_control_flow(ControlFlow::Poll);
     let mut app = App::new(font, ide);
+    if call.demo {
+        app.demo = Some(demo::Demo::cinema());
+    }
+    if let Some(path) = call.record.as_deref() {
+        match demo::Recorder::create(path) {
+            Ok(recorder) => app.recorder = Some(recorder),
+            Err(err) => {
+                eprintln!("{err}");
+                std::process::exit(1);
+            }
+        }
+    }
     app.sync_finder(true);
     if let Some(err) = opening {
         app.set_status(err);
