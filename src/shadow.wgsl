@@ -16,6 +16,8 @@ struct Globals {
     screen_right: vec4<f32>,
     screen_up: vec4<f32>,
     hud: vec4<f32>,
+    room: vec4<f32>,
+    surfaces: array<vec4<f32>, 18>,
 };
 
 @group(0) @binding(0) var<uniform> g: Globals;

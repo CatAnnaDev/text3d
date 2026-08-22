@@ -40,10 +40,10 @@ use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
 
 use camera::Camera;
-use commands::Chord;
+use commands::{Chord, Edge, Tone};
 use complete::{Completion, MIN_PREFIX};
 use font::Font;
-use hud::{Hud, HudModel, Region, Target};
+use hud::{Hud, HudModel, Quad, Region, Surface, Target};
 use ide::{Ide, Notice};
 use layout::LineLayout;
 use lsp::protocol::{Severity, SignatureInfo, Symbol};
@@ -67,6 +67,9 @@ const SPAN_LIMIT: usize = 4096;
 const SPAN_LINES: usize = 64;
 const FINDER_REFRESH: Duration = Duration::from_millis(400);
 const HOVER_DELAY: Duration = Duration::from_millis(500);
+const FACING_COSINE: f32 = 0.70;
+const AIM_TILT: f32 = 0.18;
+const VIEW_COSINE: f32 = 0.45;
 const DEMO: &str = "\
 bloc-notes en trois dimensions
 ------------------------------
@@ -76,10 +79,31 @@ biseaute, tessele depuis les contours de la
 fonte puis rendu en instancie sur le GPU,
 avec ombres portees et niveaux de detail.
 
-cmd + O ouvre un projet: l arbre des
-fichiers, les onglets, les diagnostics, la
-recherche et la completion du serveur de
-langage flottent en HUD devant la scene.
+cmd + O ouvre un projet. les panneaux d ide
+ne sont pas colles a l ecran: ils sont des
+meubles poses dans une piece construite
+autour du code. l arbre de fichiers est sur
+le mur gauche, les problemes sur le mur
+droit, le terminal au sol, les resultats de
+recherche au plafond, les onglets juste
+au-dessus de la premiere ligne. on tourne
+la vue pour les consulter.
+
+quand un panneau hors champ a du nouveau,
+une bande de couleur s allume trois
+secondes sur le bord d ecran correspondant:
+verte quand la tache a reussi, rouge quand
+il y a des erreurs, bleue pour une
+information. la compilation peut finir
+pendant que tu ecris, tu le verras.
+
+  la piece
+  option + gauche     viser l arbre
+  option + droite     viser les problemes
+  option + bas        viser le terminal
+  option + haut       viser les resultats
+  option + entree     revenir au code
+  option + 1          recadrer la vue
 
   projet
   cmd + O             ouvrir un projet
@@ -149,8 +173,11 @@ langage flottent en HUD devant la scene.
   shift + glisser     selectionner a la souris
   glisser gauche      tourner autour du texte
   glisser droit       translater
-  molette             zoom sur l editeur,
-                      defilement sur un panneau
+  clic sur un meuble  le viser, puis agir au
+                      clic suivant
+  molette             defiler la surface
+                      survolee, zoomer sur le
+                      code
 
   export
   option + E          maillage obj
@@ -160,13 +187,22 @@ langage flottent en HUD devant la scene.
 tape quelque chose, la ligne courante
 se souleve vers toi et prend la couleur
 chaude. tourne autour pour voir l epaisseur
-des glyphes.
+des glyphes et les murs de la piece.
 
 0123456789 accents: e a u i o c
 { } [ ] ( ) < > / \\ | & % $ # @ ! ?
 ";
 
+#[derive(Clone, Copy)]
+struct SurfaceCue {
+    color: [u8; 3],
+    since: Instant,
+}
+
 struct Pointer {
+    surface: Surface,
+    u: f32,
+    v: f32,
     orbiting: bool,
     panning: bool,
     selecting: bool,
@@ -183,6 +219,9 @@ struct Pointer {
 impl Pointer {
     fn new() -> Pointer {
         Pointer {
+            surface: Surface::Code,
+            u: 0.0,
+            v: 0.0,
             orbiting: false,
             panning: false,
             selecting: false,
@@ -230,6 +269,11 @@ struct App {
     overlay: Overlay,
     hud: Hud,
     camera: Camera,
+    aim: Surface,
+    cues: [Option<SurfaceCue>; commands::EDGE_COUNT],
+    cue_quads: Vec<Quad>,
+    seen_errors: usize,
+    seen_warnings: usize,
     pointer: Pointer,
     modifiers: ModifiersState,
     completion: Completion,
@@ -287,6 +331,11 @@ impl App {
             overlay: Overlay::new(),
             hud: Hud::new(),
             camera: Camera::new(),
+            aim: Surface::Code,
+            cues: [None; commands::EDGE_COUNT],
+            cue_quads: Vec::with_capacity(commands::EDGE_COUNT),
+            seen_errors: 0,
+            seen_warnings: 0,
             pointer: Pointer::new(),
             modifiers: ModifiersState::empty(),
             completion: Completion::new(),
@@ -361,7 +410,141 @@ impl App {
         self.ide.notify_edit();
     }
 
+    fn room_anchor(&self) -> Vec3 {
+        Vec3::new(self.scroll.0, self.scroll.1, 0.0)
+    }
+
+    fn surface_normal(&self, surface: Surface) -> Vec3 {
+        let normal = pick::surface_normal(&self.hud.basis(surface));
+        if normal == Vec3::ZERO { Vec3::Z } else { normal }
+    }
+
+    fn aim_normal(&self, surface: Surface) -> Vec3 {
+        let normal = self.surface_normal(surface);
+        match surface {
+            Surface::Code | Surface::Tabs | Surface::Screen => normal,
+            _ => (normal + Vec3::Z * AIM_TILT).normalize_or(normal),
+        }
+    }
+
+    fn facing_score(&self, surface: Surface) -> f32 {
+        self.camera.facing().dot(-self.surface_normal(surface))
+    }
+
+    fn aimed_at(&self, surface: Surface) -> bool {
+        self.camera.settled() && self.facing_score(surface) >= FACING_COSINE
+    }
+
+    fn in_view(&self, surface: Surface) -> bool {
+        self.facing_score(surface) >= VIEW_COSINE
+    }
+
+    fn aim_at(&mut self, surface: Surface) {
+        if self.aim == surface && !self.camera.settled() {
+            return;
+        }
+        let aspect = self.aspect();
+        let normal = self.aim_normal(surface);
+        let (center, extent) = if surface == Surface::Code {
+            let (_, half_height) = self.camera.half_extent(aspect);
+            (self.room_anchor(), half_height)
+        } else {
+            let basis = self.hud.basis(surface);
+            if !(basis.width > 0.0 && basis.height > 0.0) {
+                return;
+            }
+            let extent = (basis.height * 0.5).max(basis.width * 0.5 / aspect.max(0.01));
+            (self.hud.center_of(surface), extent)
+        };
+        self.camera.face(center, normal, extent);
+        self.aim = surface;
+        if surface == Surface::Code {
+            self.focus_locked = false;
+        }
+    }
+
+    fn aim_code(&mut self) {
+        if self.aim == Surface::Code && self.in_view(Surface::Code) {
+            return;
+        }
+        self.aim_at(Surface::Code);
+    }
+
+    fn captures_keys(&self) -> bool {
+        if !self.overlay.is_capturing_input() {
+            return false;
+        }
+        match commands::surface_of_panel(self.overlay.panel()) {
+            Some(surface) => self.aim == surface,
+            None => true,
+        }
+    }
+
+    fn sync_aim(&mut self) {
+        if self.aim != Surface::Code && self.camera.settled() && self.in_view(Surface::Code) {
+            self.aim = Surface::Code;
+        }
+    }
+
+    fn signal(&mut self, surface: Surface, tone: Tone) {
+        let Some(edge) = Edge::of(surface) else {
+            return;
+        };
+        if self.aim == surface || self.in_view(surface) {
+            return;
+        }
+        self.cues[edge.slot()] = Some(SurfaceCue { color: tone.color(), since: Instant::now() });
+    }
+
+    fn signal_diagnostics(&mut self) {
+        let (errors, warnings) = self.ide.diagnostic_counts();
+        if errors == self.seen_errors && warnings == self.seen_warnings {
+            return;
+        }
+        let tone = if errors > 0 {
+            Tone::Error
+        } else if self.seen_errors > 0 {
+            Tone::Success
+        } else if warnings > 0 {
+            Tone::Information
+        } else {
+            self.seen_errors = errors;
+            self.seen_warnings = warnings;
+            return;
+        };
+        self.seen_errors = errors;
+        self.seen_warnings = warnings;
+        self.signal(Surface::Problems, tone);
+    }
+
+    fn refresh_cues(&mut self, width: f32, height: f32) {
+        self.cue_quads.clear();
+        if !(width > 0.0 && height > 0.0) {
+            return;
+        }
+        let now = Instant::now();
+        for edge in [Edge::Left, Edge::Right, Edge::Top, Edge::Bottom] {
+            let slot = edge.slot();
+            let Some(cue) = self.cues[slot] else {
+                continue;
+            };
+            let age = now.saturating_duration_since(cue.since).as_secs_f32();
+            let alpha = commands::hint_alpha(age);
+            if alpha == 0 {
+                self.cues[slot] = None;
+                continue;
+            }
+            self.cue_quads.push(Quad {
+                rect: edge.band(width, height),
+                color: [cue.color[0], cue.color[1], cue.color[2], alpha],
+                layer: commands::HINT_LAYER,
+                surface: Surface::Screen,
+            });
+        }
+    }
+
     fn after_activate(&mut self) {
+        self.aim_code();
         self.ide.notify_activated();
         self.scroll = self.ide.workspace().scroll();
         self.focus_version = 0;
@@ -495,6 +678,9 @@ impl App {
     }
 
     fn update_focus(&mut self) {
+        if self.aim != Surface::Code {
+            return;
+        }
         if self.focus_locked {
             self.camera
                 .set_focus(Vec3::new(self.scroll.0, self.scroll.1, 0.0));
@@ -615,22 +801,52 @@ impl App {
         )
     }
 
+    fn surface_at(&self, x: f32, y: f32) -> Option<pick::SurfaceHit> {
+        let renderer = self.renderer.as_ref()?;
+        pick::hit_surfaces(
+            &self.camera,
+            renderer.aspect(),
+            self.viewport.0,
+            self.viewport.1,
+            x,
+            y,
+            &self.hud,
+        )
+    }
+
     fn press_left(&mut self) {
         let at = self.pointer.last;
         let (hud_x, hud_y) = self.hud_point(at.0, at.1);
-        let target = self.hud.hit(hud_x, hud_y);
-        if target == Target::Editor && self.overlay.is_capturing_input() {
-            self.pointer.pressed = false;
-            self.pointer.handled = true;
-            self.close_panel();
-            return;
-        }
-        if target != Target::Editor {
+        let target = self.hud.hit_screen(hud_x, hud_y);
+        if target != Target::None && target != Target::Editor {
             self.pointer.pressed = false;
             self.pointer.handled = true;
             self.pointer.clicks = 0;
             self.pointer.click_time = None;
             self.activate_target(target);
+            return;
+        }
+        if self.captures_keys() {
+            self.pointer.pressed = false;
+            self.pointer.handled = true;
+            self.close_panel();
+            return;
+        }
+
+        let found = self.surface_at(at.0, at.1);
+        let surface = found.as_ref().map_or(Surface::Code, |hit| hit.surface);
+        self.pointer.surface = surface;
+        self.pointer.u = found.as_ref().map_or(0.0, |hit| hit.u);
+        self.pointer.v = found.as_ref().map_or(0.0, |hit| hit.v);
+        self.pointer.press_at = at;
+        self.pointer.pressed = true;
+        self.pointer.moved = false;
+        self.pointer.orbiting = false;
+        self.pointer.handled = false;
+        self.pointer.selecting = false;
+        if surface != Surface::Code {
+            self.pointer.clicks = 0;
+            self.pointer.click_time = None;
             return;
         }
 
@@ -644,11 +860,6 @@ impl App {
         self.pointer.clicks = if near && quick { self.pointer.clicks % 3 + 1 } else { 1 };
         self.pointer.click_time = Some(now);
         self.pointer.click_at = at;
-        self.pointer.press_at = at;
-        self.pointer.pressed = true;
-        self.pointer.moved = false;
-        self.pointer.orbiting = false;
-        self.pointer.handled = false;
         self.pointer.selecting = self.modifiers.shift_key();
 
         if self.modifiers.super_key() {
@@ -687,10 +898,21 @@ impl App {
 
     fn release_left(&mut self) {
         let placing = self.pointer.pressed && !self.pointer.moved && !self.pointer.handled;
+        let surface = self.pointer.surface;
+        let (u, v) = (self.pointer.u, self.pointer.v);
         self.pointer.pressed = false;
         self.pointer.orbiting = false;
         self.pointer.selecting = false;
         if !placing {
+            return;
+        }
+        if surface != Surface::Code {
+            if !self.aimed_at(surface) {
+                self.aim_at(surface);
+                return;
+            }
+            let target = self.hud.hit_surface(surface, u, v);
+            self.activate_target(target);
             return;
         }
         let at = self.pointer.last;
@@ -748,21 +970,28 @@ impl App {
         let (hud_x, hud_y) = self.hud_point(at.0, at.1);
         let magnitude = amount.abs().max(1.0).round() as isize;
         let steps = if amount > 0.0 { -magnitude } else { magnitude };
-        match self.hud.region_at(hud_x, hud_y) {
-            Some(Region::Tree) => {
+        if matches!(
+            self.hud.hit_screen(hud_x, hud_y),
+            Target::PanelRow(_) | Target::Scrollbar(Region::Panel)
+        ) {
+            self.overlay.move_selection(steps);
+            return;
+        }
+        let Some(hit) = self.surface_at(at.0, at.1) else {
+            self.camera.zoom(amount);
+            return;
+        };
+        match hit.surface {
+            Surface::Tree => {
                 let total = self.ide.project().entries().len();
                 self.overlay.scroll_tree(steps, total);
             }
-            Some(Region::Output) => {
+            Surface::Output => {
                 let total = self.ide.tasks().lines().len();
                 self.overlay.scroll_output(steps, total);
             }
-            Some(Region::Panel) => self.overlay.move_selection(steps),
-            None => {
-                if self.hud.editor_rect().contains(hud_x, hud_y) {
-                    self.camera.zoom(amount);
-                }
-            }
+            Surface::Problems | Surface::Results => self.overlay.move_selection(steps),
+            Surface::Code | Surface::Tabs | Surface::Screen => self.camera.zoom(amount),
         }
     }
 
@@ -1140,8 +1369,14 @@ impl App {
 
     fn toggle_sidebar(&mut self) {
         self.overlay.toggle_sidebar();
-        self.status_message(if self.overlay.sidebar() {
-            "arbre de fichiers visible"
+        let shown = self.overlay.sidebar();
+        if shown {
+            self.aim_at(Surface::Tree);
+        } else {
+            self.aim_code();
+        }
+        self.status_message(if shown {
+            "mur gauche: arbre de fichiers"
         } else {
             "arbre de fichiers masque"
         });
@@ -1149,8 +1384,14 @@ impl App {
 
     fn toggle_output(&mut self) {
         self.overlay.toggle_output();
-        self.status_message(if self.overlay.output() {
-            "panneau de sortie visible"
+        let shown = self.overlay.output();
+        if shown {
+            self.aim_at(Surface::Output);
+        } else {
+            self.aim_code();
+        }
+        self.status_message(if shown {
+            "sol: sortie des taches"
         } else {
             "panneau de sortie masque"
         });
@@ -1158,6 +1399,7 @@ impl App {
 
     fn recenter(&mut self) {
         self.camera.reset_orientation();
+        self.aim = Surface::Code;
         self.focus_locked = false;
         self.status_message("vue recadree");
     }
@@ -1236,11 +1478,18 @@ impl App {
             self.close_find();
         }
         self.overlay.open(panel);
+        if let Some(surface) = commands::surface_of_panel(panel) {
+            self.aim_at(surface);
+        }
     }
 
     fn close_panel(&mut self) {
+        let furniture = commands::surface_of_panel(self.overlay.panel()).is_some();
         self.overlay.close();
         self.symbols.clear();
+        if furniture {
+            self.aim_code();
+        }
     }
 
     fn showing(&self, panel: Panel) -> bool {
@@ -1719,7 +1968,7 @@ impl App {
 
     fn run_task(&mut self, task: Task) {
         if !self.overlay.output() {
-            self.overlay.toggle_output();
+            self.overlay.set_output(true);
         }
         match self.ide.run_task(task) {
             Ok(()) => {
@@ -1852,6 +2101,7 @@ impl App {
                 if self.overlay.panel() == Panel::Problems {
                     self.refresh_panel_rows();
                 }
+                self.signal_diagnostics();
             }
             Notice::Completion { items, incomplete } => {
                 self.completion_partial = incomplete;
@@ -1915,18 +2165,31 @@ impl App {
                 self.focus_version = 0;
             }
             Notice::TaskFinished { label, code } => {
-                match code {
-                    Some(0) => self.set_status(format!("{label} termine")),
-                    Some(code) => self.set_status(format!("{label} echoue (code {code})")),
-                    None => self.set_status(format!("{label} interrompu")),
-                }
+                let tone = match code {
+                    Some(0) => {
+                        self.set_status(format!("{label} termine"));
+                        Tone::Success
+                    }
+                    Some(code) => {
+                        self.set_status(format!("{label} echoue (code {code})"));
+                        Tone::Error
+                    }
+                    None => {
+                        self.set_status(format!("{label} interrompu"));
+                        Tone::Information
+                    }
+                };
+                self.signal(Surface::Output, tone);
                 self.needs_diagnostics = true;
                 self.ide.project_mut().refresh();
                 if self.overlay.panel() == Panel::Problems {
                     self.refresh_panel_rows();
                 }
             }
-            Notice::Failed(message) => self.set_status(message),
+            Notice::Failed(message) => {
+                self.set_status(message);
+                self.signal(Surface::Output, Tone::Error);
+            }
         }
     }
 
@@ -1994,8 +2257,10 @@ impl App {
             Some(renderer) => renderer.hud_viewport(&self.camera),
             None => return,
         };
-        self.sync_overlay_rows(view.width, view.height);
-        let App { renderer, hud, ide, overlay, font, hover, signature, .. } = self;
+        self.sync_overlay_rows();
+        self.refresh_cues(view.width, view.height);
+        let focus = self.room_anchor();
+        let App { renderer, hud, ide, overlay, font, hover, signature, cue_quads, .. } = self;
         let Some(renderer) = renderer.as_mut() else {
             return;
         };
@@ -2015,8 +2280,9 @@ impl App {
                 hover: hover.as_deref(),
                 signature: signature.as_ref(),
                 font_name: font.name(),
+                hints: cue_quads.as_slice(),
             };
-            hud.build(view, &model);
+            hud.build(view, focus, &model);
         }
         renderer.set_hud(hud, font);
     }
@@ -2029,34 +2295,29 @@ impl App {
             return;
         }
         self.hover_since = None;
-        if !self.ide.server_ready() || self.overlay.is_capturing_input() {
+        if !self.ide.server_ready() || self.overlay.is_capturing_input() || self.aim != Surface::Code
+        {
             return;
         }
         self.ide.ask_hover();
     }
 
-    fn sync_overlay_rows(&mut self, width: f32, height: f32) {
-        let height = height.max(hud::TAB_BAR_HEIGHT + hud::STATUS_HEIGHT + 1.0);
-        let status_top = height - hud::STATUS_HEIGHT;
-        let output_top = if self.overlay.output() {
-            (status_top - hud::OUTPUT_HEIGHT).max(hud::TAB_BAR_HEIGHT)
-        } else {
-            status_top
-        };
-        if self.overlay.sidebar() && width > 0.0 {
-            let tree = ((output_top - hud::TAB_BAR_HEIGHT).max(0.0) / hud::TREE_ROW_HEIGHT)
-                .floor()
-                .max(1.0) as usize;
-            self.overlay.set_tree_rows(tree);
+    fn poll_surface_changes(&mut self) {
+        if self.overlay.sidebar() && self.hud.changed_since(Surface::Tree) {
+            self.signal(Surface::Tree, Tone::Information);
+        }
+    }
+
+    fn sync_overlay_rows(&mut self) {
+        if self.overlay.sidebar() {
+            self.overlay
+                .set_tree_rows(self.hud.rows_visible(Surface::Tree).max(1));
         }
         if !self.overlay.output() {
             return;
         }
-        let list = ((status_top - output_top - hud::OUTPUT_HEADER_HEIGHT).max(0.0)
-            / hud::OUTPUT_ROW_HEIGHT)
-            .floor()
-            .max(1.0) as usize;
-        self.overlay.set_output_rows(list);
+        self.overlay
+            .set_output_rows(self.hud.rows_visible(Surface::Output).max(1));
         let total = self.ide.tasks().lines().len();
         self.overlay.follow_output(total);
     }
@@ -2110,11 +2371,16 @@ impl App {
     }
 
     fn poll_search(&mut self) {
-        if self.overlay.panel() != Panel::Search {
-            return;
-        }
         let hits = self.ide.search().hits().len();
         let running = self.ide.search().running();
+        if self.search_running && !running && hits > 0 {
+            self.signal(Surface::Results, Tone::Information);
+        }
+        if self.overlay.panel() != Panel::Search {
+            self.search_hits = hits;
+            self.search_running = running;
+            return;
+        }
         if hits == self.search_hits && running == self.search_running {
             return;
         }
@@ -2338,10 +2604,6 @@ impl App {
                 self.after_edit();
                 self.update_completion(false);
             }
-            Key::Named(NamedKey::ArrowLeft) => self.camera.orbit(-40.0, 0.0),
-            Key::Named(NamedKey::ArrowRight) => self.camera.orbit(40.0, 0.0),
-            Key::Named(NamedKey::ArrowUp) => self.camera.orbit(0.0, -40.0),
-            Key::Named(NamedKey::ArrowDown) => self.camera.orbit(0.0, 40.0),
             Key::Named(NamedKey::PageUp) => self.camera.zoom(1.0),
             Key::Named(NamedKey::PageDown) => self.camera.zoom(-1.0),
             _ => {}
@@ -2353,7 +2615,7 @@ impl App {
             return;
         }
         let chord = Chord::from_state(self.modifiers);
-        if self.overlay.is_capturing_input() {
+        if self.captures_keys() {
             self.handle_panel_key(event, chord, event_loop);
             return;
         }
@@ -2544,6 +2806,8 @@ impl App {
         }
 
         self.build_hud();
+        self.poll_surface_changes();
+        self.sync_aim();
         self.update_focus();
         self.camera.update(dt);
 

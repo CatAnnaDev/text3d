@@ -1,19 +1,19 @@
-use crate::lsp::protocol::SignatureInfo;
-use crate::overlay::{Overlay, Panel, Row};
+use crate::lsp::protocol::{Diagnostic, Severity, SignatureInfo};
+use crate::overlay::{Overlay, Panel, Row, RowKind};
 use crate::project::Project;
-use crate::search::ProjectSearch;
+use crate::search::{Hit, ProjectSearch};
 use crate::syntax::Language;
 use crate::tasks::{Stream, TaskRunner};
 use crate::text::Cursor;
 use crate::workspace::Tab;
+use glam::Vec3;
 use std::fmt::Write;
+use std::path::Path;
 
 pub const CHAR_WIDTH: f32 = 0.6;
 pub const TAB_BAR_HEIGHT: f32 = 1.8;
-pub const SIDEBAR_WIDTH: f32 = 26.0;
 pub const STATUS_HEIGHT: f32 = 1.5;
-pub const OUTPUT_HEIGHT: f32 = 14.0;
-pub const OUTPUT_HEADER_HEIGHT: f32 = 1.4;
+pub const HEADER_HEIGHT: f32 = 1.6;
 pub const PALETTE_WIDTH: f32 = 64.0;
 pub const PALETTE_TOP: f32 = 4.0;
 pub const TREE_ROW_HEIGHT: f32 = 1.3;
@@ -24,6 +24,20 @@ pub const TREE_INDENT: f32 = 1.2;
 pub const CHEVRON_WIDTH: f32 = 1.2;
 pub const SCROLLBAR_WIDTH: f32 = 0.4;
 pub const CARD_MAX_WIDTH: f32 = 70.0;
+
+pub const ROOM_X: f32 = 34.0;
+pub const ROOM_Z: f32 = 16.0;
+pub const ROOM_Y: f32 = 24.0;
+pub const WALL_WIDTH: f32 = 28.0;
+pub const WALL_HEIGHT: f32 = 26.0;
+pub const DECK_WIDTH: f32 = 60.0;
+pub const DECK_HEIGHT: f32 = 16.0;
+pub const CODE_WIDTH: f32 = 60.0;
+pub const CODE_HEIGHT: f32 = 34.0;
+pub const TABS_WIDTH: f32 = 60.0;
+pub const TABS_LIFT: f32 = 1.0;
+pub const TABS_DEPTH: f32 = 0.35;
+pub const DECK_TILT: f32 = 0.12;
 
 const TAB_PAD: f32 = 0.6;
 const TAB_GAP: f32 = 0.35;
@@ -45,6 +59,10 @@ const CARD_MIN_WIDTH: f32 = 14.0;
 const DETAIL_FRACTION: f32 = 0.42;
 const ELLIPSIS: &str = "..";
 const ELLIPSIS_CHARS: usize = 2;
+const SURFACE_COUNT: usize = 7;
+const AXIS_SLACK: f32 = 1.0e-6;
+const MARK_PRIME: u64 = 0x0000_0100_0000_01b3;
+const MARK_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 
 const LAYER_BAR: u8 = 0;
 const LAYER_BAR_TEXT: u8 = 1;
@@ -55,7 +73,6 @@ const LAYER_PANEL_TEXT: u8 = 5;
 
 const BAR_FILL: [u8; 4] = [1, 2, 4, 255];
 const BAR_EDGE: [u8; 4] = [9, 16, 35, 220];
-const SIDEBAR_FILL: [u8; 4] = [1, 2, 3, 255];
 const TAB_FILL: [u8; 4] = [2, 3, 7, 255];
 const TAB_ACTIVE_FILL: [u8; 4] = [4, 6, 16, 255];
 const TAB_ACCENT: [u8; 4] = [34, 146, 233, 255];
@@ -80,7 +97,49 @@ const SCROLLBAR_TRACK: [u8; 4] = [2, 3, 8, 200];
 const SCROLLBAR_THUMB: [u8; 4] = [19, 32, 67, 220];
 const SELECTED_ROW: [u8; 4] = [5, 11, 27, 220];
 
+static WORLD_SURFACES: [Surface; 5] = [
+    Surface::Tabs,
+    Surface::Tree,
+    Surface::Problems,
+    Surface::Output,
+    Surface::Results,
+];
+
 pub struct HudViewport {
+    pub width: f32,
+    pub height: f32,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Surface {
+    Code,
+    Tree,
+    Problems,
+    Output,
+    Results,
+    Tabs,
+    Screen,
+}
+
+impl Surface {
+    fn index(self) -> usize {
+        match self {
+            Surface::Code => 0,
+            Surface::Tree => 1,
+            Surface::Problems => 2,
+            Surface::Output => 3,
+            Surface::Results => 4,
+            Surface::Tabs => 5,
+            Surface::Screen => 6,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Basis {
+    pub origin: Vec3,
+    pub right: Vec3,
+    pub down: Vec3,
     pub width: f32,
     pub height: f32,
 }
@@ -116,6 +175,7 @@ pub struct Quad {
     pub rect: Rect,
     pub color: [u8; 4],
     pub layer: u8,
+    pub surface: Surface,
 }
 
 #[derive(Clone, Debug)]
@@ -125,6 +185,7 @@ pub struct Label {
     pub text: String,
     pub color: [u8; 4],
     pub layer: u8,
+    pub surface: Surface,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -149,6 +210,13 @@ pub enum Region {
     Output,
 }
 
+#[derive(Clone, Copy)]
+struct Zone {
+    rect: Rect,
+    target: Target,
+    surface: Surface,
+}
+
 pub struct HudModel<'a> {
     pub project: &'a Project,
     pub tabs: &'a [Tab],
@@ -163,6 +231,7 @@ pub struct HudModel<'a> {
     pub hover: Option<&'a str>,
     pub signature: Option<&'a SignatureInfo>,
     pub font_name: &'a str,
+    pub hints: &'a [Quad],
 }
 
 pub struct Hud {
@@ -170,11 +239,14 @@ pub struct Hud {
     quad_count: usize,
     labels: Vec<Label>,
     label_count: usize,
-    hits: Vec<(Rect, Target)>,
-    hit_count: usize,
-    regions: Vec<(Rect, Region)>,
-    region_count: usize,
+    zones: Vec<Zone>,
+    zone_count: usize,
     editor: Rect,
+    focus: Vec3,
+    surface: Surface,
+    marks: [u64; SURFACE_COUNT],
+    changed: [bool; SURFACE_COUNT],
+    primed: bool,
     scratch: String,
     wrap: Vec<(usize, usize)>,
 }
@@ -192,11 +264,14 @@ impl Hud {
             quad_count: 0,
             labels: Vec::with_capacity(256),
             label_count: 0,
-            hits: Vec::with_capacity(128),
-            hit_count: 0,
-            regions: Vec::with_capacity(8),
-            region_count: 0,
+            zones: Vec::with_capacity(128),
+            zone_count: 0,
             editor: Rect::new(0.0, 0.0, 0.0, 0.0),
+            focus: Vec3::ZERO,
+            surface: Surface::Screen,
+            marks: [0; SURFACE_COUNT],
+            changed: [false; SURFACE_COUNT],
+            primed: false,
             scratch: String::with_capacity(256),
             wrap: Vec::with_capacity(64),
         }
@@ -210,14 +285,94 @@ impl Hud {
         &self.labels[..self.label_count]
     }
 
+    pub fn surfaces(&self) -> &[Surface] {
+        &WORLD_SURFACES
+    }
+
     pub fn editor_rect(&self) -> Rect {
         self.editor
     }
 
-    pub fn hit(&self, x: f32, y: f32) -> Target {
-        for &(rect, target) in self.hits[..self.hit_count].iter().rev() {
-            if rect.contains(x, y) {
-                return target;
+    pub fn focus(&self) -> Vec3 {
+        self.focus
+    }
+
+    pub fn basis(&self, surface: Surface) -> Basis {
+        let focus = self.focus();
+        match surface {
+            Surface::Code => centered(focus, Vec3::NEG_Z, CODE_WIDTH, CODE_HEIGHT),
+            Surface::Tabs => framed(
+                Vec3::new(0.0, TABS_LIFT + TAB_BAR_HEIGHT, TABS_DEPTH),
+                Vec3::NEG_Z,
+                TABS_WIDTH,
+                TAB_BAR_HEIGHT,
+            ),
+            Surface::Tree => centered(
+                Vec3::new(focus.x - ROOM_X, focus.y, ROOM_Z),
+                Vec3::NEG_X,
+                WALL_WIDTH,
+                WALL_HEIGHT,
+            ),
+            Surface::Problems => centered(
+                Vec3::new(focus.x + ROOM_X, focus.y, ROOM_Z),
+                Vec3::X,
+                WALL_WIDTH,
+                WALL_HEIGHT,
+            ),
+            Surface::Output => centered(
+                Vec3::new(focus.x, focus.y - ROOM_Y, ROOM_Z),
+                deck_facing(-1.0),
+                DECK_WIDTH,
+                DECK_HEIGHT,
+            ),
+            Surface::Results => centered(
+                Vec3::new(focus.x, focus.y + ROOM_Y, ROOM_Z),
+                deck_facing(1.0),
+                DECK_WIDTH,
+                DECK_HEIGHT,
+            ),
+            Surface::Screen => Basis {
+                origin: Vec3::ZERO,
+                right: Vec3::X,
+                down: Vec3::NEG_Y,
+                width: self.editor.w,
+                height: self.editor.h,
+            },
+        }
+    }
+
+    pub fn center_of(&self, surface: Surface) -> Vec3 {
+        let basis = self.basis(surface);
+        basis.origin + basis.right * (basis.width * 0.5) + basis.down * (basis.height * 0.5)
+    }
+
+    pub fn rows_visible(&self, surface: Surface) -> usize {
+        match surface {
+            Surface::Tree => rows_in(WALL_HEIGHT - HEADER_HEIGHT, TREE_ROW_HEIGHT),
+            Surface::Problems => rows_in(WALL_HEIGHT - HEADER_HEIGHT, PANEL_ROW_HEIGHT),
+            Surface::Output => rows_in(DECK_HEIGHT - HEADER_HEIGHT, OUTPUT_ROW_HEIGHT),
+            Surface::Results => rows_in(DECK_HEIGHT - HEADER_HEIGHT, PANEL_ROW_HEIGHT),
+            _ => 0,
+        }
+    }
+
+    pub fn changed_since(&self, surface: Surface) -> bool {
+        self.changed[surface.index()]
+    }
+
+    pub fn hit_surface(&self, surface: Surface, u: f32, v: f32) -> Target {
+        for zone in self.zones[..self.zone_count].iter().rev() {
+            if zone.surface == surface && zone.rect.contains(u, v) {
+                return zone.target;
+            }
+        }
+        Target::None
+    }
+
+    pub fn hit_screen(&self, x: f32, y: f32) -> Target {
+        for zone in self.zones[..self.zone_count].iter().rev() {
+            if zone.surface == Surface::Screen && zone.rect.contains(x, y) {
+                return zone.target;
             }
         }
         if self.editor.contains(x, y) {
@@ -226,59 +381,49 @@ impl Hud {
         Target::None
     }
 
-    pub fn region_at(&self, x: f32, y: f32) -> Option<Region> {
-        for &(rect, region) in self.regions[..self.region_count].iter().rev() {
-            if rect.contains(x, y) {
-                return Some(region);
-            }
-        }
-        None
-    }
-
-    pub fn build(&mut self, view: HudViewport, model: &HudModel) {
+    pub fn build(&mut self, view: HudViewport, focus: Vec3, model: &HudModel) {
         self.quad_count = 0;
         self.label_count = 0;
-        self.hit_count = 0;
-        self.region_count = 0;
+        self.zone_count = 0;
+        self.focus = focus;
 
         let width = view.width.max(1.0);
-        let height = view.height.max(TAB_BAR_HEIGHT + STATUS_HEIGHT + 1.0);
-        let status_top = height - STATUS_HEIGHT;
-        let output_top = if model.overlay.output() {
-            (status_top - OUTPUT_HEIGHT).max(TAB_BAR_HEIGHT)
-        } else {
-            status_top
-        };
-        let sidebar_width = if model.overlay.sidebar() {
-            SIDEBAR_WIDTH.min(width * 0.5)
-        } else {
-            0.0
-        };
-        self.editor = Rect::new(
-            sidebar_width,
-            TAB_BAR_HEIGHT,
-            (width - sidebar_width).max(0.0),
-            (output_top - TAB_BAR_HEIGHT).max(0.0),
-        );
+        let height = view.height.max(STATUS_HEIGHT + 1.0);
+        self.editor = Rect::new(0.0, 0.0, width, height);
 
-        self.build_tabs(width, model);
-        if sidebar_width > 0.0 {
-            self.build_tree(sidebar_width, TAB_BAR_HEIGHT, output_top, model);
-        }
-        if model.overlay.output() {
-            self.build_output(width, output_top, status_top, model);
-        }
-        self.build_status(width, status_top, model);
+        self.build_code();
+        self.build_tabs(model);
+        self.build_tree(model);
+        self.build_problems(model);
+        self.build_output(model);
+        self.build_results(model);
+
+        self.surface = Surface::Screen;
+        self.build_status(width, height, model);
         if model.overlay.panel() == Panel::None {
             self.build_cards(model);
         } else {
             self.build_palette(width, height, model);
         }
+        for hint in model.hints {
+            self.push_hint(*hint);
+        }
+        self.mark_changes(model);
     }
 
-    fn build_tabs(&mut self, width: f32, model: &HudModel) {
-        let bar = Rect::new(0.0, 0.0, width, TAB_BAR_HEIGHT);
-        self.push_quad(bar, BAR_FILL, LAYER_BAR);
+    fn build_code(&mut self) {
+        self.surface = Surface::Code;
+        self.push_zone(Rect::new(0.0, 0.0, CODE_WIDTH, CODE_HEIGHT), Target::Editor);
+    }
+
+    fn build_tabs(&mut self, model: &HudModel) {
+        self.surface = Surface::Tabs;
+        let width = TABS_WIDTH;
+        self.push_quad(
+            Rect::new(0.0, 0.0, width, TAB_BAR_HEIGHT),
+            BAR_FILL,
+            LAYER_BAR,
+        );
         self.push_quad(
             Rect::new(0.0, TAB_BAR_HEIGHT - EDGE_THICKNESS, width, EDGE_THICKNESS),
             BAR_EDGE,
@@ -363,7 +508,7 @@ impl Hud {
                     );
                 }
             }
-            self.push_hit(rect, Target::Tab(index));
+            self.push_zone(rect, Target::Tab(index));
             let close = Rect::new(
                 x + span - TAB_PAD - TAB_CLOSE_WIDTH,
                 0.0,
@@ -378,25 +523,29 @@ impl Hud {
                     LAYER_BAR_TEXT,
                     "x",
                 );
-                self.push_hit(close, Target::TabClose(index));
+                self.push_zone(close, Target::TabClose(index));
             }
             x += span;
         }
     }
 
-    fn build_tree(&mut self, width: f32, top: f32, bottom: f32, model: &HudModel) {
-        let area = Rect::new(0.0, top, width, (bottom - top).max(0.0));
-        self.push_quad(area, SIDEBAR_FILL, LAYER_BAR);
-        self.push_quad(
-            Rect::new(width - EDGE_THICKNESS, top, EDGE_THICKNESS, area.h),
-            BAR_EDGE,
-            LAYER_BAR,
-        );
-        self.push_region(area, Region::Tree);
+    fn build_tree(&mut self, model: &HudModel) {
+        self.surface = Surface::Tree;
+        let open = model.overlay.sidebar();
+        self.scratch.clear();
+        self.scratch.push_str(model.project.label());
+        let content = self.panel_shell(WALL_WIDTH, WALL_HEIGHT, "explorateur", TEXT_ACCENT, open);
+        if !open {
+            return;
+        }
 
         let entries = model.project.entries();
-        let visible = (area.h / TREE_ROW_HEIGHT).floor().max(0.0) as usize;
-        if visible == 0 || entries.is_empty() {
+        let visible = self.rows_visible(Surface::Tree);
+        if visible == 0 {
+            return;
+        }
+        if entries.is_empty() {
+            self.push_note(content, WALL_WIDTH, "projet vide");
             return;
         }
         let max_scroll = entries.len().saturating_sub(visible);
@@ -415,8 +564,8 @@ impl Hud {
             };
             let row = Rect::new(
                 0.0,
-                top + slot as f32 * TREE_ROW_HEIGHT,
-                width,
+                content.y + slot as f32 * TREE_ROW_HEIGHT,
+                WALL_WIDTH,
                 TREE_ROW_HEIGHT,
             );
             if index == selection {
@@ -433,13 +582,13 @@ impl Hud {
                     LAYER_BAR_TEXT,
                     if entry.expanded { "v" } else { ">" },
                 );
-                self.push_hit(row, Target::TreeRow(index));
-                self.push_hit(toggle, Target::TreeToggle(index));
+                self.push_zone(row, Target::TreeRow(index));
+                self.push_zone(toggle, Target::TreeToggle(index));
             } else {
-                self.push_hit(row, Target::TreeRow(index));
+                self.push_zone(row, Target::TreeRow(index));
             }
             let name_x = indent + CHEVRON_WIDTH;
-            let room = width - name_x - TREE_PAD - bar;
+            let room = WALL_WIDTH - name_x - TREE_PAD - bar;
             let max_chars = (room / CHAR_WIDTH).floor().max(0.0) as usize;
             let color = if entry.is_dir {
                 DIR_COLOR
@@ -459,63 +608,110 @@ impl Hud {
         }
 
         if bar > 0.0 {
-            let track = Rect::new(width - bar, top, bar, area.h);
+            let track = Rect::new(WALL_WIDTH - bar, content.y, bar, content.h);
             self.push_scrollbar(track, entries.len(), visible, scroll);
-            self.push_hit(track, Target::Scrollbar(Region::Tree));
+            self.push_zone(track, Target::Scrollbar(Region::Tree));
         }
     }
 
-    fn build_output(&mut self, width: f32, top: f32, bottom: f32, model: &HudModel) {
-        let area = Rect::new(0.0, top, width, (bottom - top).max(0.0));
-        self.push_quad(area, BAR_FILL, LAYER_BAR);
-        self.push_quad(
-            Rect::new(0.0, top, width, EDGE_THICKNESS),
-            BAR_EDGE,
-            LAYER_BAR,
-        );
-        self.push_region(area, Region::Output);
-
-        let header = Rect::new(0.0, top, width, OUTPUT_HEADER_HEIGHT.min(area.h));
-        let baseline = baseline_of(header);
-        let mut x = STATUS_PAD;
-        x += self.push_label(x, baseline, TEXT_DIM, LAYER_BAR_TEXT, "sortie") + STATUS_GAP;
-        if !model.tasks.label().is_empty() {
-            x += self.push_label(
-                x,
-                baseline,
-                TEXT_ACCENT,
-                LAYER_BAR_TEXT,
-                model.tasks.label(),
-            ) + STATUS_GAP;
-        }
+    fn build_problems(&mut self, model: &HudModel) {
+        self.surface = Surface::Problems;
+        let (errors, warnings) = model.diagnostics;
+        let notes = model.tasks.diagnostics();
+        let listed = model.overlay.panel() == Panel::Problems;
+        let full = listed || errors > 0 || warnings > 0 || !notes.is_empty();
         self.scratch.clear();
-        if model.tasks.running() {
-            self.scratch.push_str("en cours");
+        let _ = write!(
+            self.scratch,
+            "{} erreurs  {} avertissements",
+            errors, warnings
+        );
+        let tone = if errors > 0 {
+            ERROR_COLOR
+        } else if warnings > 0 {
+            WARNING_COLOR
         } else {
-            match model.tasks.exit_code() {
-                Some(0) => self.scratch.push_str("termine"),
-                Some(code) => {
-                    let _ = write!(self.scratch, "echec {}", code);
-                }
-                None => self.scratch.push_str("inactif"),
-            }
+            TEXT_FAINT
+        };
+        let content = self.panel_shell(WALL_WIDTH, WALL_HEIGHT, "problemes", tone, full);
+        if !full || content.h <= 0.0 {
+            return;
         }
-        let color = if model.tasks.running() {
+        let visible = self.rows_visible(Surface::Problems);
+        if visible == 0 {
+            return;
+        }
+        if listed {
+            self.list_rows(model.overlay, content, WALL_WIDTH, visible);
+            return;
+        }
+        if notes.is_empty() {
+            self.push_note(content, WALL_WIDTH, "detail dans le panneau problemes");
+            return;
+        }
+        let max_chars = ((WALL_WIDTH - PANEL_PAD * 2.0) / CHAR_WIDTH)
+            .floor()
+            .max(0.0) as usize;
+        let shown = visible.min(notes.len());
+        for slot in 0..shown {
+            let (path, item) = &notes[slot];
+            let row = Rect::new(
+                0.0,
+                content.y + slot as f32 * PANEL_ROW_HEIGHT,
+                WALL_WIDTH,
+                PANEL_ROW_HEIGHT,
+            );
+            digest_diagnostic(&mut self.scratch, path, item);
+            let color = severity_color(item.severity);
+            self.emit_clipped(
+                PANEL_PAD,
+                baseline_of(row),
+                color,
+                LAYER_BAR_TEXT,
+                max_chars,
+            );
+        }
+    }
+
+    fn build_output(&mut self, model: &HudModel) {
+        self.surface = Surface::Output;
+        let tasks = model.tasks;
+        let lines = tasks.lines();
+        let full = model.overlay.output() || tasks.running() || !lines.is_empty();
+        self.scratch.clear();
+        if !tasks.label().is_empty() {
+            self.scratch.push_str(tasks.label());
+            self.scratch.push_str("  ");
+        }
+        let color = if tasks.running() {
+            self.scratch.push_str("en cours");
             RUNNING_COLOR
         } else {
-            match model.tasks.exit_code() {
-                Some(0) => RUNNING_COLOR,
-                Some(_) => ERROR_COLOR,
-                None => TEXT_FAINT,
+            match tasks.exit_code() {
+                Some(0) => {
+                    self.scratch.push_str("termine");
+                    RUNNING_COLOR
+                }
+                Some(code) => {
+                    let _ = write!(self.scratch, "echec {}", code);
+                    ERROR_COLOR
+                }
+                None => {
+                    self.scratch.push_str("inactif");
+                    TEXT_FAINT
+                }
             }
         };
-        self.emit_scratch(x, baseline, color, LAYER_BAR_TEXT);
-
-        let list_top = top + header.h;
-        let list_height = (bottom - list_top).max(0.0);
-        let visible = (list_height / OUTPUT_ROW_HEIGHT).floor().max(0.0) as usize;
-        let lines = model.tasks.lines();
-        if visible == 0 || lines.is_empty() {
+        let content = self.panel_shell(DECK_WIDTH, DECK_HEIGHT, "sortie", color, full);
+        if !full || content.h <= 0.0 {
+            return;
+        }
+        let visible = self.rows_visible(Surface::Output);
+        if visible == 0 {
+            return;
+        }
+        if lines.is_empty() {
+            self.push_note(content, DECK_WIDTH, "aucune sortie");
             return;
         }
         let first = output_window(lines.len(), visible, model.overlay.output_scroll());
@@ -524,7 +720,7 @@ impl Hud {
         } else {
             0.0
         };
-        let room = width - STATUS_PAD * 2.0 - bar;
+        let room = DECK_WIDTH - PANEL_PAD * 2.0 - bar;
         let max_chars = (room / CHAR_WIDTH).floor().max(0.0) as usize;
 
         for slot in 0..visible {
@@ -534,8 +730,8 @@ impl Hud {
             };
             let row = Rect::new(
                 0.0,
-                list_top + slot as f32 * OUTPUT_ROW_HEIGHT,
-                width,
+                content.y + slot as f32 * OUTPUT_ROW_HEIGHT,
+                DECK_WIDTH,
                 OUTPUT_ROW_HEIGHT,
             );
             let color = match line.stream {
@@ -543,24 +739,188 @@ impl Hud {
                 Stream::Out => STDOUT_COLOR,
             };
             self.push_clipped(
-                STATUS_PAD,
+                PANEL_PAD,
                 baseline_of(row),
                 color,
                 LAYER_BAR_TEXT,
                 &line.text,
                 max_chars,
             );
-            self.push_hit(row, Target::OutputLine(index));
+            self.push_zone(row, Target::OutputLine(index));
         }
 
         if bar > 0.0 {
-            let track = Rect::new(width - bar, list_top, bar, list_height);
+            let track = Rect::new(DECK_WIDTH - bar, content.y, bar, content.h);
             self.push_scrollbar(track, lines.len(), visible, first);
-            self.push_hit(track, Target::Scrollbar(Region::Output));
+            self.push_zone(track, Target::Scrollbar(Region::Output));
         }
     }
 
-    fn build_status(&mut self, width: f32, top: f32, model: &HudModel) {
+    fn build_results(&mut self, model: &HudModel) {
+        self.surface = Surface::Results;
+        let panel = model.overlay.panel();
+        let mirrored = matches!(panel, Panel::Search | Panel::References);
+        let hits = model.search.hits();
+        let full = mirrored || model.search.running() || !hits.is_empty();
+        let title = if panel == Panel::References {
+            "references"
+        } else {
+            "resultats"
+        };
+        self.scratch.clear();
+        if model.search.running() {
+            let (done, total) = model.search.progress();
+            let _ = write!(self.scratch, "recherche {}/{}", done, total);
+        } else if !model.search.needle().is_empty() {
+            let _ = write!(
+                self.scratch,
+                "{}  {} resultats",
+                model.search.needle(),
+                hits.len()
+            );
+        } else if mirrored {
+            let _ = write!(self.scratch, "{} lignes", model.overlay.rows().len());
+        }
+        let content = self.panel_shell(DECK_WIDTH, DECK_HEIGHT, title, TEXT_DIM, full);
+        if !full || content.h <= 0.0 {
+            return;
+        }
+        let visible = self.rows_visible(Surface::Results);
+        if visible == 0 {
+            return;
+        }
+        if mirrored {
+            self.list_rows(model.overlay, content, DECK_WIDTH, visible);
+            return;
+        }
+        if hits.is_empty() {
+            self.push_note(content, DECK_WIDTH, "aucun resultat");
+            return;
+        }
+        let max_chars = ((DECK_WIDTH - PANEL_PAD * 2.0) / CHAR_WIDTH)
+            .floor()
+            .max(0.0) as usize;
+        let shown = visible.min(hits.len());
+        for slot in 0..shown {
+            let row = Rect::new(
+                0.0,
+                content.y + slot as f32 * PANEL_ROW_HEIGHT,
+                DECK_WIDTH,
+                PANEL_ROW_HEIGHT,
+            );
+            digest_hit(&mut self.scratch, &hits[slot]);
+            self.emit_clipped(
+                PANEL_PAD,
+                baseline_of(row),
+                STDOUT_COLOR,
+                LAYER_BAR_TEXT,
+                max_chars,
+            );
+        }
+    }
+
+    fn list_rows(&mut self, overlay: &Overlay, content: Rect, width: f32, visible: usize) {
+        let rows = overlay.visible_rows();
+        if rows.is_empty() {
+            self.push_note(content, width, "aucune ligne");
+            return;
+        }
+        let total = overlay.rows().len();
+        let shown = visible.min(rows.len());
+        let bar = if total > shown { SCROLLBAR_WIDTH } else { 0.0 };
+        let selected = overlay.selected().map(|row| row as *const Row);
+        for slot in 0..shown {
+            let row = &rows[slot];
+            let rect = Rect::new(
+                0.0,
+                content.y + slot as f32 * PANEL_ROW_HEIGHT,
+                width,
+                PANEL_ROW_HEIGHT,
+            );
+            let current = selected == Some(row as *const Row);
+            if current {
+                self.push_quad(rect, PANEL_SELECTED, LAYER_BAR);
+            }
+            let line = baseline_of(rect);
+            let mut left = PANEL_PAD;
+            if !row.tag.is_empty() {
+                left +=
+                    self.push_label(left, line, TEXT_FAINT, LAYER_BAR_TEXT, row.tag) + CHAR_WIDTH;
+            }
+            let detail_room = (width * DETAIL_FRACTION - PANEL_PAD).max(0.0);
+            let detail_max = (detail_room / CHAR_WIDTH).floor().max(0.0) as usize;
+            let detail_shown = row.detail.chars().count().min(detail_max);
+            let detail_width = detail_shown as f32 * CHAR_WIDTH;
+            let detail_x = width - PANEL_PAD - bar - detail_width;
+            let label_room = (detail_x - CHAR_WIDTH - left).max(0.0);
+            let label_max = (label_room / CHAR_WIDTH).floor().max(0.0) as usize;
+            self.push_clipped(
+                left,
+                line,
+                row_color(row.kind, current),
+                LAYER_BAR_TEXT,
+                &row.label,
+                label_max,
+            );
+            if detail_shown > 0 {
+                self.push_clipped(
+                    detail_x,
+                    line,
+                    TEXT_FAINT,
+                    LAYER_BAR_TEXT,
+                    &row.detail,
+                    detail_max,
+                );
+            }
+            self.push_zone(rect, Target::PanelRow(slot));
+        }
+        if bar > 0.0 {
+            let track = Rect::new(width - bar, content.y, bar, shown as f32 * PANEL_ROW_HEIGHT);
+            self.push_scrollbar(track, total, shown, overlay.scroll());
+            self.push_zone(track, Target::Scrollbar(Region::Panel));
+        }
+    }
+
+    fn panel_shell(
+        &mut self,
+        width: f32,
+        height: f32,
+        title: &str,
+        note_color: [u8; 4],
+        full: bool,
+    ) -> Rect {
+        let body = if full { height } else { HEADER_HEIGHT };
+        self.push_quad(Rect::new(0.0, 0.0, width, body), PANEL_FILL, LAYER_BAR);
+        self.push_border(Rect::new(0.0, 0.0, width, body), PANEL_EDGE, LAYER_BAR);
+        self.push_quad(
+            Rect::new(0.0, HEADER_HEIGHT - EDGE_THICKNESS, width, EDGE_THICKNESS),
+            BAR_EDGE,
+            LAYER_BAR,
+        );
+        let baseline = baseline_of(Rect::new(0.0, 0.0, width, HEADER_HEIGHT));
+        let mut x = PANEL_PAD;
+        x += self.push_label(x, baseline, TEXT_ACCENT, LAYER_BAR_TEXT, title) + STATUS_GAP;
+        let room = width - PANEL_PAD - x;
+        let max_chars = (room / CHAR_WIDTH).floor().max(0.0) as usize;
+        self.emit_clipped(x, baseline, note_color, LAYER_BAR_TEXT, max_chars);
+        Rect::new(0.0, HEADER_HEIGHT, width, (body - HEADER_HEIGHT).max(0.0))
+    }
+
+    fn push_note(&mut self, content: Rect, width: f32, text: &str) {
+        let row = Rect::new(0.0, content.y, width, PANEL_ROW_HEIGHT);
+        let max_chars = ((width - PANEL_PAD * 2.0) / CHAR_WIDTH).floor().max(0.0) as usize;
+        self.push_clipped(
+            PANEL_PAD,
+            baseline_of(row),
+            TEXT_FAINT,
+            LAYER_BAR_TEXT,
+            text,
+            max_chars,
+        );
+    }
+
+    fn build_status(&mut self, width: f32, height: f32, model: &HudModel) {
+        let top = height - STATUS_HEIGHT;
         let bar = Rect::new(0.0, top, width, STATUS_HEIGHT);
         self.push_quad(bar, BAR_FILL, LAYER_BAR);
         self.push_quad(
@@ -631,7 +991,7 @@ impl Hud {
         }
         let server_width =
             self.push_label(x, baseline, TEXT_DIM, LAYER_BAR_TEXT, model.server_status);
-        self.push_hit(
+        self.push_zone(
             Rect::new(
                 x - STATUS_GAP * 0.5,
                 top,
@@ -660,7 +1020,7 @@ impl Hud {
             TEXT_FAINT
         };
         let diagnostics_width = self.emit_scratch(x, baseline, color, LAYER_BAR_TEXT);
-        self.push_hit(
+        self.push_zone(
             Rect::new(
                 x - STATUS_GAP * 0.5,
                 top,
@@ -728,8 +1088,7 @@ impl Hud {
             LAYER_PANEL,
         );
         self.push_quad(panel, PANEL_FILL, LAYER_PANEL);
-        self.push_region(panel, Region::Panel);
-        self.push_hit(panel, Target::None);
+        self.push_zone(panel, Target::None);
 
         let input = Rect::new(x, y + PANEL_PAD, panel_width, PANEL_ROW_HEIGHT);
         let baseline = baseline_of(input);
@@ -803,7 +1162,7 @@ impl Hud {
             self.push_clipped(
                 left,
                 line,
-                if current { TEXT_MAIN } else { TEXT_DIM },
+                row_color(row.kind, current),
                 LAYER_PANEL_TEXT,
                 &row.label,
                 label_max,
@@ -818,7 +1177,7 @@ impl Hud {
                     detail_max,
                 );
             }
-            self.push_hit(rect, Target::PanelRow(slot));
+            self.push_zone(rect, Target::PanelRow(slot));
         }
 
         if bar > 0.0 {
@@ -829,7 +1188,7 @@ impl Hud {
                 rows.len() as f32 * PANEL_ROW_HEIGHT,
             );
             self.push_scrollbar(track, total_rows, rows.len(), overlay.scroll());
-            self.push_hit(track, Target::Scrollbar(Region::Panel));
+            self.push_zone(track, Target::Scrollbar(Region::Panel));
         }
 
         let footer = Rect::new(
@@ -906,7 +1265,7 @@ impl Hud {
             );
             baseline += CARD_ROW_HEIGHT;
         }
-        self.push_hit(card, Target::None);
+        self.push_zone(card, Target::None);
     }
 
     fn build_signature_card(&mut self, signature: &SignatureInfo, anchor_x: f32, anchor_y: f32) {
@@ -971,7 +1330,7 @@ impl Hud {
             );
             baseline += CARD_ROW_HEIGHT;
         }
-        self.push_hit(card, Target::None);
+        self.push_zone(card, Target::None);
     }
 
     fn card_max_chars(&self) -> usize {
@@ -1039,11 +1398,28 @@ impl Hud {
         );
     }
 
+    fn push_border(&mut self, rect: Rect, color: [u8; 4], layer: u8) {
+        let edge = PANEL_EDGE_WIDTH;
+        for side in [
+            Rect::new(rect.x - edge, rect.y - edge, rect.w + edge * 2.0, edge),
+            Rect::new(rect.x - edge, rect.y + rect.h, rect.w + edge * 2.0, edge),
+            Rect::new(rect.x - edge, rect.y, edge, rect.h),
+            Rect::new(rect.x + rect.w, rect.y, edge, rect.h),
+        ] {
+            self.push_quad(side, color, layer);
+        }
+    }
+
     fn push_quad(&mut self, rect: Rect, color: [u8; 4], layer: u8) {
         if rect.w <= 0.0 || rect.h <= 0.0 {
             return;
         }
-        let quad = Quad { rect, color, layer };
+        let quad = Quad {
+            rect,
+            color,
+            layer,
+            surface: self.surface,
+        };
         if self.quad_count == self.quads.len() {
             self.quads.push(quad);
         } else {
@@ -1052,31 +1428,37 @@ impl Hud {
         self.quad_count += 1;
     }
 
-    fn push_hit(&mut self, rect: Rect, target: Target) {
-        if rect.w <= 0.0 || rect.h <= 0.0 {
+    fn push_hint(&mut self, hint: Quad) {
+        if hint.rect.w <= 0.0 || hint.rect.h <= 0.0 || hint.color[3] == 0 {
             return;
         }
-        if self.hit_count == self.hits.len() {
-            self.hits.push((rect, target));
+        if self.quad_count == self.quads.len() {
+            self.quads.push(hint);
         } else {
-            self.hits[self.hit_count] = (rect, target);
+            self.quads[self.quad_count] = hint;
         }
-        self.hit_count += 1;
+        self.quad_count += 1;
     }
 
-    fn push_region(&mut self, rect: Rect, region: Region) {
+    fn push_zone(&mut self, rect: Rect, target: Target) {
         if rect.w <= 0.0 || rect.h <= 0.0 {
             return;
         }
-        if self.region_count == self.regions.len() {
-            self.regions.push((rect, region));
+        let zone = Zone {
+            rect,
+            target,
+            surface: self.surface,
+        };
+        if self.zone_count == self.zones.len() {
+            self.zones.push(zone);
         } else {
-            self.regions[self.region_count] = (rect, region);
+            self.zones[self.zone_count] = zone;
         }
-        self.region_count += 1;
+        self.zone_count += 1;
     }
 
     fn reserve_label(&mut self, x: f32, y: f32, color: [u8; 4], layer: u8) -> &mut String {
+        let surface = self.surface;
         if self.label_count == self.labels.len() {
             self.labels.push(Label {
                 x,
@@ -1084,6 +1466,7 @@ impl Hud {
                 text: String::with_capacity(48),
                 color,
                 layer,
+                surface,
             });
         } else {
             let slot = &mut self.labels[self.label_count];
@@ -1091,6 +1474,7 @@ impl Hud {
             slot.y = y;
             slot.color = color;
             slot.layer = layer;
+            slot.surface = surface;
             slot.text.clear();
         }
         let index = self.label_count;
@@ -1142,6 +1526,141 @@ impl Hud {
         let width = self.push_label(x, y, color, layer, &text);
         self.scratch = text;
         width
+    }
+
+    fn emit_clipped(&mut self, x: f32, y: f32, color: [u8; 4], layer: u8, max_chars: usize) -> f32 {
+        let text = std::mem::take(&mut self.scratch);
+        let width = self.push_clipped(x, y, color, layer, &text, max_chars);
+        self.scratch = text;
+        width
+    }
+
+    fn mark_changes(&mut self, model: &HudModel) {
+        let mut marks = [0u64; SURFACE_COUNT];
+        marks[Surface::Tabs.index()] = mix(model.tabs.len() as u64, model.active_tab as u64);
+        marks[Surface::Tree.index()] = mix(
+            model.project.entries().len() as u64,
+            u64::from(model.overlay.sidebar()),
+        );
+        marks[Surface::Problems.index()] = mix(
+            mix(model.diagnostics.0 as u64, model.diagnostics.1 as u64),
+            model.tasks.diagnostics().len() as u64,
+        );
+        marks[Surface::Output.index()] =
+            mix(model.tasks.lines().len() as u64, task_state(model.tasks));
+        marks[Surface::Results.index()] = mix(
+            model.search.hits().len() as u64,
+            u64::from(model.search.running()),
+        );
+        for index in 0..SURFACE_COUNT {
+            self.changed[index] = self.primed && marks[index] != self.marks[index];
+            self.marks[index] = marks[index];
+        }
+        self.primed = true;
+    }
+}
+
+fn framed(origin: Vec3, facing: Vec3, width: f32, height: f32) -> Basis {
+    let reference = if facing.y.abs() > 0.5 {
+        Vec3::new(0.0, 0.0, facing.y)
+    } else {
+        Vec3::Y
+    };
+    let right = axis_aligned(facing.cross(reference).normalize_or(Vec3::X));
+    let down = axis_aligned(facing.cross(right));
+    Basis {
+        origin,
+        right,
+        down,
+        width,
+        height,
+    }
+}
+
+fn deck_facing(vertical: f32) -> Vec3 {
+    let (tilt_sin, tilt_cos) = DECK_TILT.sin_cos();
+    Vec3::new(0.0, vertical * tilt_cos, -tilt_sin)
+}
+
+fn axis_aligned(vector: Vec3) -> Vec3 {
+    Vec3::new(snapped(vector.x), snapped(vector.y), snapped(vector.z))
+}
+
+fn snapped(value: f32) -> f32 {
+    if value.abs() < AXIS_SLACK { 0.0 } else { value }
+}
+
+fn centered(center: Vec3, facing: Vec3, width: f32, height: f32) -> Basis {
+    let mut basis = framed(Vec3::ZERO, facing, width, height);
+    basis.origin = center - basis.right * (width * 0.5) - basis.down * (height * 0.5);
+    basis
+}
+
+fn rows_in(height: f32, row: f32) -> usize {
+    if row <= 0.0 {
+        return 0;
+    }
+    (height / row).floor().max(0.0) as usize
+}
+
+fn mix(left: u64, right: u64) -> u64 {
+    let mut value = MARK_BASIS ^ left;
+    value = value.wrapping_mul(MARK_PRIME);
+    value ^= right;
+    value.wrapping_mul(MARK_PRIME)
+}
+
+fn task_state(tasks: &TaskRunner) -> u64 {
+    if tasks.running() {
+        return 1;
+    }
+    match tasks.exit_code() {
+        Some(code) => mix(2, code as i64 as u64),
+        None => 0,
+    }
+}
+
+fn severity_color(severity: Severity) -> [u8; 4] {
+    match severity {
+        Severity::Error => ERROR_COLOR,
+        Severity::Warning => WARNING_COLOR,
+        Severity::Information => TEXT_ACCENT,
+        Severity::Hint => TEXT_DIM,
+    }
+}
+
+fn row_color(kind: RowKind, current: bool) -> [u8; 4] {
+    match kind {
+        RowKind::Error => ERROR_COLOR,
+        RowKind::Warning => WARNING_COLOR,
+        RowKind::Information => TEXT_ACCENT,
+        _ if current => TEXT_MAIN,
+        _ => TEXT_DIM,
+    }
+}
+
+fn digest_diagnostic(scratch: &mut String, path: &Path, item: &Diagnostic) {
+    scratch.clear();
+    if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
+        scratch.push_str(name);
+    }
+    let _ = write!(scratch, ":{}  ", item.range.start.line + 1);
+    scratch.push_str(first_line(&item.message));
+}
+
+fn digest_hit(scratch: &mut String, hit: &Hit) {
+    scratch.clear();
+    if let Some(name) = hit.path.file_name().and_then(|name| name.to_str()) {
+        scratch.push_str(name);
+    }
+    let _ = write!(scratch, ":{}  ", hit.line + 1);
+    scratch.push_str(first_line(hit.preview.trim_start()));
+}
+
+fn first_line(text: &str) -> &str {
+    match text.find('\n') {
+        Some(offset) => &text[..offset],
+        None => text,
     }
 }
 
@@ -1232,8 +1751,10 @@ fn wrap_text(text: &str, max_chars: usize, out: &mut Vec<(usize, usize)>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::camera::Camera;
     use crate::overlay::{Row, RowKind};
     use crate::tasks::Task;
+    use glam::Vec4;
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1241,6 +1762,9 @@ mod tests {
 
     const VIEW_WIDTH: f32 = 120.0;
     const VIEW_HEIGHT: f32 = 60.0;
+    const SLACK: f32 = 1.0e-4;
+    const SCREEN_WIDTH: f32 = 1600.0;
+    const SCREEN_HEIGHT: f32 = 1000.0;
 
     struct Sandbox {
         root: PathBuf,
@@ -1280,6 +1804,9 @@ mod tests {
         hover: Option<String>,
         signature: Option<SignatureInfo>,
         active: usize,
+        diagnostics: (usize, usize),
+        focus: Vec3,
+        hints: Vec<Quad>,
     }
 
     impl Fixture {
@@ -1301,6 +1828,9 @@ mod tests {
                 hover: None,
                 signature: None,
                 active: 0,
+                diagnostics: (2, 3),
+                focus: Vec3::new(5.0, -21.0, 0.0),
+                hints: Vec::new(),
             }
         }
 
@@ -1313,12 +1843,13 @@ mod tests {
                 tasks: &self.tasks,
                 search: &self.search,
                 server_status: "serveur pret",
-                diagnostics: (2, 3),
+                diagnostics: self.diagnostics,
                 cursor: Cursor { line: 4, column: 7 },
                 language: Some(Language::Rust),
                 hover: self.hover.as_deref(),
                 signature: self.signature.as_ref(),
                 font_name: "inter",
+                hints: &self.hints,
             }
         }
 
@@ -1328,6 +1859,7 @@ mod tests {
                     width: VIEW_WIDTH,
                     height: VIEW_HEIGHT,
                 },
+                self.focus,
                 &self.model(),
             );
         }
@@ -1356,6 +1888,267 @@ mod tests {
         tab_span(name)
     }
 
+    fn every_surface() -> [Surface; 6] {
+        [
+            Surface::Code,
+            Surface::Tabs,
+            Surface::Tree,
+            Surface::Problems,
+            Surface::Output,
+            Surface::Results,
+        ]
+    }
+
+    fn wall_surfaces() -> [Surface; 4] {
+        [
+            Surface::Tree,
+            Surface::Problems,
+            Surface::Output,
+            Surface::Results,
+        ]
+    }
+
+    #[test]
+    fn surface_bases_are_orthonormal() {
+        let fixture = Fixture::new("bases");
+        let mut hud = Hud::new();
+        fixture.build(&mut hud);
+        assert!(!hud.surfaces().contains(&Surface::Code));
+        assert!(!hud.surfaces().contains(&Surface::Screen));
+        for surface in every_surface() {
+            let basis = hud.basis(surface);
+            assert!(
+                (basis.right.length() - 1.0).abs() < SLACK,
+                "right unitaire sur {:?}",
+                surface
+            );
+            assert!(
+                (basis.down.length() - 1.0).abs() < SLACK,
+                "down unitaire sur {:?}",
+                surface
+            );
+            assert!(
+                basis.right.dot(basis.down).abs() < SLACK,
+                "right orthogonal a down sur {:?}",
+                surface
+            );
+            assert!(basis.width > 0.0 && basis.height > 0.0);
+        }
+    }
+
+    #[test]
+    fn visible_faces_look_at_the_room_centre() {
+        let fixture = Fixture::new("faces");
+        let mut hud = Hud::new();
+        fixture.build(&mut hud);
+        for surface in wall_surfaces() {
+            let basis = hud.basis(surface);
+            let outward = basis.right.cross(basis.down);
+            let facing = -outward;
+            let centre = fixture.focus + Vec3::Z * ROOM_Z;
+            let to_centre = centre - hud.center_of(surface);
+            assert!(
+                to_centre.length() > 1.0,
+                "la surface {:?} doit etre a distance du centre",
+                surface
+            );
+            assert!(
+                facing.dot(to_centre.normalize()) > 0.99,
+                "la face visible de {:?} doit regarder le centre",
+                surface
+            );
+            assert!(
+                outward.dot(to_centre) < 0.0,
+                "le dos de {:?} doit regarder l exterieur",
+                surface
+            );
+        }
+        for surface in [Surface::Code, Surface::Tabs] {
+            let basis = hud.basis(surface);
+            let facing = -basis.right.cross(basis.down);
+            assert!(
+                (facing - Vec3::Z).length() < SLACK,
+                "le plan du code regarde la camera"
+            );
+        }
+    }
+
+    #[test]
+    fn surface_bases_have_the_exact_reading_vectors() {
+        let fixture = Fixture::new("vecteurs");
+        let mut hud = Hud::new();
+        fixture.build(&mut hud);
+        let expected = [
+            (Surface::Code, Vec3::X, Vec3::NEG_Y),
+            (Surface::Tabs, Vec3::X, Vec3::NEG_Y),
+            (Surface::Tree, Vec3::NEG_Z, Vec3::NEG_Y),
+            (Surface::Problems, Vec3::Z, Vec3::NEG_Y),
+            (
+                Surface::Output,
+                Vec3::X,
+                Vec3::new(0.0, -DECK_TILT.sin(), DECK_TILT.cos()),
+            ),
+            (
+                Surface::Results,
+                Vec3::X,
+                Vec3::new(0.0, -DECK_TILT.sin(), -DECK_TILT.cos()),
+            ),
+        ];
+        for (surface, right, down) in expected {
+            let basis = hud.basis(surface);
+            assert!(
+                (basis.right - right).length() < SLACK,
+                "right de {:?}: {:?}",
+                surface,
+                basis.right
+            );
+            assert!(
+                (basis.down - down).length() < SLACK,
+                "down de {:?}: {:?}",
+                surface,
+                basis.down
+            );
+        }
+    }
+
+    #[test]
+    fn the_room_is_built_around_the_focus() {
+        let fixture = Fixture::new("piece");
+        let mut hud = Hud::new();
+        fixture.build(&mut hud);
+        let focus = fixture.focus;
+        assert!((hud.center_of(Surface::Code) - focus).length() < SLACK);
+        assert!(
+            (hud.center_of(Surface::Tree) - Vec3::new(focus.x - ROOM_X, focus.y, ROOM_Z)).length()
+                < SLACK
+        );
+        assert!(
+            (hud.center_of(Surface::Problems) - Vec3::new(focus.x + ROOM_X, focus.y, ROOM_Z)).length()
+                < SLACK
+        );
+        assert!(
+            (hud.center_of(Surface::Output) - Vec3::new(focus.x, focus.y - ROOM_Y, ROOM_Z)).length()
+                < SLACK
+        );
+        assert!(
+            (hud.center_of(Surface::Results) - Vec3::new(focus.x, focus.y + ROOM_Y, ROOM_Z)).length()
+                < SLACK
+        );
+
+        let before = hud.basis(Surface::Tree).origin;
+        let moved = Vec3::new(focus.x + 3.0, focus.y - 9.0, 0.0);
+        hud.build(
+            HudViewport {
+                width: VIEW_WIDTH,
+                height: VIEW_HEIGHT,
+            },
+            moved,
+            &fixture.model(),
+        );
+        let after = hud.basis(Surface::Tree).origin;
+        assert!((after - before - (moved - focus)).length() < SLACK);
+    }
+
+    #[test]
+    fn the_tab_shelf_floats_just_above_the_first_line() {
+        let fixture = Fixture::new("etagere");
+        let mut hud = Hud::new();
+        fixture.build(&mut hud);
+        let basis = hud.basis(Surface::Tabs);
+        let bottom = basis.origin + basis.down * basis.height;
+        assert!(basis.origin.y > bottom.y);
+        assert!(bottom.y >= TABS_LIFT - SLACK);
+        assert!(basis.origin.z > 0.0);
+        let moved = Vec3::new(40.0, -200.0, 0.0);
+        hud.build(
+            HudViewport {
+                width: VIEW_WIDTH,
+                height: VIEW_HEIGHT,
+            },
+            moved,
+            &fixture.model(),
+        );
+        assert!((hud.basis(Surface::Tabs).origin - basis.origin).length() < SLACK);
+    }
+
+    fn facing_camera(basis: &Basis) -> Camera {
+        let mut camera = Camera::new();
+        let normal = basis.down.cross(basis.right).normalize_or(Vec3::Z);
+        let center =
+            basis.origin + basis.right * (basis.width * 0.5) + basis.down * (basis.height * 0.5);
+        camera.face(center, normal, basis.width.max(basis.height) * 0.5);
+        camera.snap();
+        camera
+    }
+
+    fn screen_of(camera: &Camera, point: Vec3) -> (f32, f32) {
+        let clip = camera.view_proj(SCREEN_WIDTH / SCREEN_HEIGHT)
+            * Vec4::new(point.x, point.y, point.z, 1.0);
+        assert!(clip.w > 0.0, "point derriere la camera");
+        (
+            (clip.x / clip.w * 0.5 + 0.5) * SCREEN_WIDTH,
+            (0.5 - clip.y / clip.w * 0.5) * SCREEN_HEIGHT,
+        )
+    }
+
+    #[test]
+    fn the_reading_direction_goes_right_and_down_on_screen() {
+        let fixture = Fixture::new("lecture");
+        let mut hud = Hud::new();
+        fixture.build(&mut hud);
+        for surface in every_surface() {
+            let basis = hud.basis(surface);
+            let camera = facing_camera(&basis);
+            let start = basis.origin + basis.right * 1.0 + basis.down * 1.0;
+            let ahead = start + basis.right * (basis.width * 0.4);
+            let below = start + basis.down * (basis.height * 0.4);
+            let (start_x, start_y) = screen_of(&camera, start);
+            let (ahead_x, ahead_y) = screen_of(&camera, ahead);
+            let (below_x, below_y) = screen_of(&camera, below);
+            assert!(
+                ahead_x - start_x > 10.0,
+                "{:?} doit se lire vers la droite ({} -> {})",
+                surface,
+                start_x,
+                ahead_x
+            );
+            assert!(
+                (ahead_y - start_y).abs() < 60.0,
+                "{:?} doit garder ses lignes horizontales",
+                surface
+            );
+            assert!(
+                below_y - start_y > 10.0,
+                "{:?} doit empiler ses lignes vers le bas ({} -> {})",
+                surface,
+                start_y,
+                below_y
+            );
+            assert!(
+                (below_x - start_x).abs() < 60.0,
+                "{:?} ne doit pas pencher ses colonnes",
+                surface
+            );
+        }
+    }
+
+    #[test]
+    fn local_points_round_trip_through_the_basis() {
+        let fixture = Fixture::new("aller-retour");
+        let mut hud = Hud::new();
+        fixture.build(&mut hud);
+        for surface in every_surface() {
+            let basis = hud.basis(surface);
+            let u = basis.width * 0.31;
+            let v = basis.height * 0.72;
+            let world = basis.origin + basis.right * u + basis.down * v;
+            let local = world - basis.origin;
+            assert!((local.dot(basis.right) - u).abs() < SLACK);
+            assert!((local.dot(basis.down) - v).abs() < SLACK);
+            assert!(local.dot(basis.right.cross(basis.down)).abs() < SLACK);
+        }
+    }
+
     #[test]
     fn tab_borders_are_exact() {
         let fixture = Fixture::new("onglets");
@@ -1364,15 +2157,25 @@ mod tests {
 
         let first = tab_width("aaa.rs");
         let second = tab_width("bbb.rs");
-        assert_eq!(hud.hit(0.0, 0.0), Target::Tab(0));
+        assert_eq!(hud.hit_surface(Surface::Tabs, 0.0, 0.0), Target::Tab(0));
         assert_eq!(
-            hud.hit(first - 0.001, TAB_BAR_HEIGHT - 0.001),
+            hud.hit_surface(Surface::Tabs, first - 0.001, TAB_BAR_HEIGHT - 0.001),
             Target::Tab(0)
         );
-        assert_eq!(hud.hit(first, 0.4), Target::Tab(1));
-        assert_eq!(hud.hit(first + second - 0.001, 0.4), Target::Tab(1));
-        assert_eq!(hud.hit(first + second, 0.4), Target::Tab(2));
-        assert_ne!(hud.hit(0.2, TAB_BAR_HEIGHT), Target::Tab(0));
+        assert_eq!(hud.hit_surface(Surface::Tabs, first, 0.4), Target::Tab(1));
+        assert_eq!(
+            hud.hit_surface(Surface::Tabs, first + second - 0.001, 0.4),
+            Target::Tab(1)
+        );
+        assert_eq!(
+            hud.hit_surface(Surface::Tabs, first + second, 0.4),
+            Target::Tab(2)
+        );
+        assert_eq!(
+            hud.hit_surface(Surface::Tabs, 0.2, TAB_BAR_HEIGHT),
+            Target::None
+        );
+        assert_eq!(hud.hit_surface(Surface::Tree, 0.2, 0.2), Target::None);
     }
 
     #[test]
@@ -1384,19 +2187,40 @@ mod tests {
         let first = tab_width("aaa.rs");
         let close_start = first - TAB_PAD - TAB_CLOSE_WIDTH;
         let close_end = close_start + TAB_CLOSE_WIDTH;
-        assert_eq!(hud.hit(close_start - 0.001, 0.9), Target::Tab(0));
-        assert_eq!(hud.hit(close_start, 0.9), Target::TabClose(0));
-        assert_eq!(hud.hit(close_end - 0.001, 0.9), Target::TabClose(0));
-        assert_eq!(hud.hit(close_end, 0.9), Target::Tab(0));
-        assert_eq!(hud.hit(close_start, 0.0), Target::TabClose(0));
         assert_eq!(
-            hud.hit(close_start, TAB_BAR_HEIGHT - 0.001),
+            hud.hit_surface(Surface::Tabs, close_start - 0.001, 0.9),
+            Target::Tab(0)
+        );
+        assert_eq!(
+            hud.hit_surface(Surface::Tabs, close_start, 0.9),
             Target::TabClose(0)
         );
-        assert_ne!(hud.hit(close_start, TAB_BAR_HEIGHT), Target::TabClose(0));
+        assert_eq!(
+            hud.hit_surface(Surface::Tabs, close_end - 0.001, 0.9),
+            Target::TabClose(0)
+        );
+        assert_eq!(
+            hud.hit_surface(Surface::Tabs, close_end, 0.9),
+            Target::Tab(0)
+        );
+        assert_eq!(
+            hud.hit_surface(Surface::Tabs, close_start, 0.0),
+            Target::TabClose(0)
+        );
+        assert_eq!(
+            hud.hit_surface(Surface::Tabs, close_start, TAB_BAR_HEIGHT - 0.001),
+            Target::TabClose(0)
+        );
+        assert_eq!(
+            hud.hit_surface(Surface::Tabs, close_start, TAB_BAR_HEIGHT),
+            Target::None
+        );
 
         let second_close = first + tab_width("bbb.rs") - TAB_PAD - TAB_CLOSE_WIDTH;
-        assert_eq!(hud.hit(second_close, 0.9), Target::TabClose(1));
+        assert_eq!(
+            hud.hit_surface(Surface::Tabs, second_close, 0.9),
+            Target::TabClose(1)
+        );
     }
 
     #[test]
@@ -1410,20 +2234,37 @@ mod tests {
         fixture.build(&mut hud);
         let span = tab_span("fichier29.rs");
         let slack = 0.01;
-        assert_eq!(hud.hit(VIEW_WIDTH - 0.001, 0.9), Target::Tab(29));
-        assert_eq!(hud.hit(VIEW_WIDTH - span + slack, 0.9), Target::Tab(29));
-        assert_eq!(hud.hit(VIEW_WIDTH - span - slack, 0.9), Target::Tab(28));
         assert_eq!(
-            hud.hit(VIEW_WIDTH - TAB_PAD - TAB_CLOSE_WIDTH + slack, 0.9),
+            hud.hit_surface(Surface::Tabs, TABS_WIDTH - 0.001, 0.9),
+            Target::Tab(29)
+        );
+        assert_eq!(
+            hud.hit_surface(Surface::Tabs, TABS_WIDTH - span + slack, 0.9),
+            Target::Tab(29)
+        );
+        assert_eq!(
+            hud.hit_surface(Surface::Tabs, TABS_WIDTH - span - slack, 0.9),
+            Target::Tab(28)
+        );
+        assert_eq!(
+            hud.hit_surface(
+                Surface::Tabs,
+                TABS_WIDTH - TAB_PAD - TAB_CLOSE_WIDTH + slack,
+                0.9
+            ),
             Target::TabClose(29)
         );
         assert_eq!(
-            hud.hit(VIEW_WIDTH - TAB_PAD - TAB_CLOSE_WIDTH - slack, 0.9),
+            hud.hit_surface(
+                Surface::Tabs,
+                TABS_WIDTH - TAB_PAD - TAB_CLOSE_WIDTH - slack,
+                0.9
+            ),
             Target::Tab(29)
         );
         fixture.active = 0;
         fixture.build(&mut hud);
-        assert_eq!(hud.hit(0.0, 0.9), Target::Tab(0));
+        assert_eq!(hud.hit_surface(Surface::Tabs, 0.0, 0.9), Target::Tab(0));
     }
 
     #[test]
@@ -1435,36 +2276,58 @@ mod tests {
         assert!(fixture.project.entries()[0].is_dir);
         assert!(fixture.project.entries()[1].is_dir);
 
-        let top = TAB_BAR_HEIGHT;
-        assert_eq!(hud.hit(0.0, top), Target::TreeRow(0));
-        assert_eq!(hud.hit(TREE_PAD - 0.001, top), Target::TreeRow(0));
-        assert_eq!(hud.hit(TREE_PAD, top), Target::TreeToggle(0));
+        let top = HEADER_HEIGHT;
+        assert_eq!(hud.hit_surface(Surface::Tree, 0.0, top), Target::TreeRow(0));
         assert_eq!(
-            hud.hit(TREE_PAD + CHEVRON_WIDTH - 0.001, top),
+            hud.hit_surface(Surface::Tree, TREE_PAD - 0.001, top),
+            Target::TreeRow(0)
+        );
+        assert_eq!(
+            hud.hit_surface(Surface::Tree, TREE_PAD, top),
             Target::TreeToggle(0)
         );
-        assert_eq!(hud.hit(TREE_PAD + CHEVRON_WIDTH, top), Target::TreeRow(0));
         assert_eq!(
-            hud.hit(TREE_PAD, top + TREE_ROW_HEIGHT - 0.001),
+            hud.hit_surface(Surface::Tree, TREE_PAD + CHEVRON_WIDTH - 0.001, top),
             Target::TreeToggle(0)
         );
-        assert_eq!(hud.hit(TREE_PAD, top + TREE_ROW_HEIGHT), Target::TreeRow(1));
+        assert_eq!(
+            hud.hit_surface(Surface::Tree, TREE_PAD + CHEVRON_WIDTH, top),
+            Target::TreeRow(0)
+        );
+        assert_eq!(
+            hud.hit_surface(Surface::Tree, TREE_PAD, top + TREE_ROW_HEIGHT - 0.001),
+            Target::TreeToggle(0)
+        );
+        assert_eq!(
+            hud.hit_surface(Surface::Tree, TREE_PAD, top + TREE_ROW_HEIGHT),
+            Target::TreeRow(1)
+        );
 
         let nested = TREE_PAD + TREE_INDENT;
         assert_eq!(
-            hud.hit(nested - 0.001, top + TREE_ROW_HEIGHT),
+            hud.hit_surface(Surface::Tree, nested - 0.001, top + TREE_ROW_HEIGHT),
             Target::TreeRow(1)
         );
         assert_eq!(
-            hud.hit(nested, top + TREE_ROW_HEIGHT),
+            hud.hit_surface(Surface::Tree, nested, top + TREE_ROW_HEIGHT),
             Target::TreeToggle(1)
         );
         assert_eq!(
-            hud.hit(nested, top + TREE_ROW_HEIGHT * 2.0),
+            hud.hit_surface(Surface::Tree, nested, top + TREE_ROW_HEIGHT * 2.0),
             Target::TreeRow(2)
         );
-        assert_eq!(hud.hit(SIDEBAR_WIDTH - 0.001, top), Target::TreeRow(0));
-        assert_eq!(hud.hit(SIDEBAR_WIDTH, top), Target::Editor);
+        assert_eq!(
+            hud.hit_surface(Surface::Tree, WALL_WIDTH - 0.001, top),
+            Target::TreeRow(0)
+        );
+        assert_eq!(
+            hud.hit_surface(Surface::Tree, WALL_WIDTH, top),
+            Target::None
+        );
+        assert_eq!(
+            hud.hit_surface(Surface::Tree, 1.0, HEADER_HEIGHT - 0.001),
+            Target::None
+        );
     }
 
     #[test]
@@ -1484,167 +2347,181 @@ mod tests {
         fixture.build(&mut hud);
         assert_eq!(fixture.overlay.tree_scroll(), 3);
         assert_eq!(
-            hud.hit(SIDEBAR_WIDTH * 0.5, TAB_BAR_HEIGHT),
+            hud.hit_surface(Surface::Tree, WALL_WIDTH * 0.5, HEADER_HEIGHT),
             Target::TreeRow(3)
         );
         assert_eq!(
-            hud.hit(SIDEBAR_WIDTH * 0.5, TAB_BAR_HEIGHT + TREE_ROW_HEIGHT),
+            hud.hit_surface(
+                Surface::Tree,
+                WALL_WIDTH * 0.5,
+                HEADER_HEIGHT + TREE_ROW_HEIGHT
+            ),
             Target::TreeRow(4)
         );
     }
 
     #[test]
-    fn editor_rect_takes_the_remaining_space() {
-        let mut fixture = Fixture::new("zone-editeur");
+    fn scrollbars_answer_when_the_tree_overflows() {
+        let mut fixture = Fixture::new("ascenseur");
+        for index in 0..80 {
+            fs::write(
+                fixture.sandbox.root.join(format!("f{:03}.rs", index)),
+                "fn f() {}\n",
+            )
+            .expect("fichier de test");
+        }
+        fixture.project = Project::open(&fixture.sandbox.root);
         let mut hud = Hud::new();
         fixture.build(&mut hud);
-        let editor = hud.editor_rect();
-        assert_eq!(editor.x, SIDEBAR_WIDTH);
-        assert_eq!(editor.y, TAB_BAR_HEIGHT);
-        assert_eq!(editor.w, VIEW_WIDTH - SIDEBAR_WIDTH);
-        assert_eq!(editor.h, VIEW_HEIGHT - STATUS_HEIGHT - TAB_BAR_HEIGHT);
-        assert_eq!(hud.hit(editor.x, editor.y), Target::Editor);
         assert_eq!(
-            hud.hit(editor.right() - 0.001, editor.bottom() - 0.001),
-            Target::Editor
+            hud.hit_surface(Surface::Tree, WALL_WIDTH - 0.001, HEADER_HEIGHT + 1.0),
+            Target::Scrollbar(Region::Tree)
         );
-        assert_ne!(hud.hit(editor.x, editor.bottom()), Target::Editor);
-
-        fixture.overlay.toggle_sidebar();
-        fixture.overlay.toggle_output();
-        fixture.build(&mut hud);
-        let editor = hud.editor_rect();
-        assert_eq!(editor.x, 0.0);
-        assert_eq!(editor.w, VIEW_WIDTH);
         assert_eq!(
-            editor.h,
-            VIEW_HEIGHT - STATUS_HEIGHT - OUTPUT_HEIGHT - TAB_BAR_HEIGHT
+            hud.hit_surface(
+                Surface::Tree,
+                WALL_WIDTH - SCROLLBAR_WIDTH - 0.001,
+                HEADER_HEIGHT + 1.0
+            ),
+            Target::TreeRow(0)
         );
-        assert_eq!(hud.hit(1.0, TAB_BAR_HEIGHT), Target::Editor);
     }
 
     #[test]
-    fn palette_rows_are_exact_and_capture_everything_below() {
-        let mut fixture = Fixture::new("palette");
-        fixture.overlay.open(Panel::QuickOpen);
-        let rows: Vec<Row> = (0..6)
-            .map(|index| sample_row(&format!("fichier{}.rs", index), "src"))
-            .collect();
-        fixture.overlay.set_rows(rows);
+    fn a_closed_tree_keeps_only_its_title_plate() {
+        let mut fixture = Fixture::new("arbre-ferme");
+        fixture.overlay.toggle_sidebar();
+        assert!(!fixture.overlay.sidebar());
         let mut hud = Hud::new();
         fixture.build(&mut hud);
-
-        let panel_width = PALETTE_WIDTH.min(VIEW_WIDTH - 8.0);
-        let panel_x = (VIEW_WIDTH - panel_width) * 0.5;
-        let list_top = PALETTE_TOP + PANEL_PAD + PANEL_ROW_HEIGHT + EDGE_THICKNESS;
-        let middle = panel_x + panel_width * 0.5;
-
-        assert_eq!(hud.hit(middle, list_top), Target::PanelRow(0));
+        let plate = hud
+            .quads()
+            .iter()
+            .filter(|quad| quad.surface == Surface::Tree && quad.color == PANEL_FILL)
+            .max_by(|left, right| {
+                left.rect
+                    .h
+                    .partial_cmp(&right.rect.h)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .expect("plaque de titre");
+        assert!((plate.rect.h - HEADER_HEIGHT).abs() < SLACK);
         assert_eq!(
-            hud.hit(middle, list_top + PANEL_ROW_HEIGHT - 0.001),
+            hud.hit_surface(Surface::Tree, 1.0, HEADER_HEIGHT + 1.0),
+            Target::None
+        );
+        let title = hud
+            .labels()
+            .iter()
+            .find(|label| label.surface == Surface::Tree && label.text == "explorateur");
+        assert!(title.is_some());
+    }
+
+    #[test]
+    fn the_problems_wall_shows_the_counts_and_the_task_diagnostics() {
+        let mut fixture = Fixture::new("mur-problemes");
+        fixture.diagnostics = (4, 1);
+        let mut hud = Hud::new();
+        fixture.build(&mut hud);
+        let counts = hud
+            .labels()
+            .iter()
+            .find(|label| label.surface == Surface::Problems && label.text.contains("erreurs"))
+            .expect("compteurs sur le mur");
+        assert_eq!(counts.text, "4 erreurs  1 avertissements");
+        assert_eq!(counts.color, ERROR_COLOR);
+        let hint = hud.labels().iter().any(|label| {
+            label.surface == Surface::Problems && label.text == "detail dans le panneau problemes"
+        });
+        assert!(hint);
+
+        fixture.diagnostics = (0, 0);
+        fixture.build(&mut hud);
+        let quiet = hud
+            .quads()
+            .iter()
+            .filter(|quad| quad.surface == Surface::Problems && quad.color == PANEL_FILL)
+            .all(|quad| quad.rect.h <= HEADER_HEIGHT + SLACK);
+        assert!(quiet);
+        assert!(
+            hud.labels()
+                .iter()
+                .filter(|label| label.surface == Surface::Problems)
+                .count()
+                <= 2
+        );
+        fixture.diagnostics = (4, 1);
+
+        fixture.overlay.open(Panel::Problems);
+        fixture.overlay.set_rows(vec![
+            sample_row("valeur inutilisee", "src/main.rs:12"),
+            sample_row("type inconnu", "src/hud.rs:4"),
+        ]);
+        fixture.build(&mut hud);
+        assert_eq!(
+            hud.hit_surface(Surface::Problems, 2.0, HEADER_HEIGHT),
             Target::PanelRow(0)
         );
         assert_eq!(
-            hud.hit(middle, list_top + PANEL_ROW_HEIGHT),
+            hud.hit_surface(Surface::Problems, 2.0, HEADER_HEIGHT + PANEL_ROW_HEIGHT),
             Target::PanelRow(1)
         );
         assert_eq!(
-            hud.hit(middle, list_top + PANEL_ROW_HEIGHT * 5.0),
-            Target::PanelRow(5)
-        );
-        assert_eq!(
-            hud.hit(middle, list_top + PANEL_ROW_HEIGHT * 6.0),
+            hud.hit_surface(
+                Surface::Problems,
+                2.0,
+                HEADER_HEIGHT + PANEL_ROW_HEIGHT * 2.0
+            ),
             Target::None
         );
-        assert_eq!(hud.hit(panel_x, list_top), Target::PanelRow(0));
-        assert_eq!(hud.hit(panel_x - 0.001, list_top), Target::Editor);
-        assert_eq!(
-            hud.hit(panel_x + panel_width - 0.001, list_top),
-            Target::PanelRow(0)
-        );
-        assert_eq!(hud.hit(panel_x + panel_width, list_top), Target::Editor);
-        assert_eq!(hud.hit(middle, PALETTE_TOP), Target::None);
-        assert_eq!(hud.region_at(middle, list_top), Some(Region::Panel));
     }
 
     #[test]
-    fn palette_covers_the_tab_bar_when_it_reaches_it() {
-        let mut fixture = Fixture::new("palette-couvre");
-        fixture.overlay.open(Panel::Commands);
-        let rows: Vec<Row> = (0..16)
-            .map(|index| sample_row(&format!("commande {}", index), "cmd"))
-            .collect();
-        fixture.overlay.set_rows(rows);
-        let mut hud = Hud::new();
-        hud.build(
-            HudViewport {
-                width: VIEW_WIDTH,
-                height: 30.0,
-            },
-            &fixture.model(),
-        );
-        let panel_width = PALETTE_WIDTH.min(VIEW_WIDTH - 8.0);
-        let panel_x = (VIEW_WIDTH - panel_width) * 0.5;
-        let panel = Rect::new(panel_x, 0.0, panel_width, 30.0);
-        let mut covered = false;
-        for step in 0..40 {
-            let y = step as f32 * 0.5;
-            if !panel.contains(panel_x + 1.0, y) {
-                continue;
-            }
-            let target = hud.hit(panel_x + 1.0, y);
-            if y < TAB_BAR_HEIGHT {
-                assert!(
-                    matches!(target, Target::None | Target::PanelRow(_)),
-                    "la palette doit capturer la barre d onglets"
-                );
-                covered = true;
-            }
+    fn the_results_ceiling_lists_real_search_hits() {
+        let mut fixture = Fixture::new("plafond");
+        let files = vec![
+            fixture.sandbox.root.join("aaa.rs"),
+            fixture.sandbox.root.join("bbb.rs"),
+        ];
+        fixture.search.start(&files, "fn", false, false);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while fixture.search.running() && Instant::now() < deadline {
+            fixture.search.poll();
+            std::thread::sleep(Duration::from_millis(2));
         }
-        assert!(covered);
-    }
-
-    #[test]
-    fn palette_scrollbar_appears_when_rows_overflow() {
-        let mut fixture = Fixture::new("palette-ascenseur");
-        fixture.overlay.open(Panel::Problems);
-        let rows: Vec<Row> = (0..40)
-            .map(|index| sample_row(&format!("probleme {}", index), "src/main.rs"))
-            .collect();
-        fixture.overlay.set_rows(rows);
+        assert!(
+            !fixture.search.hits().is_empty(),
+            "la recherche doit trouver des lignes"
+        );
         let mut hud = Hud::new();
         fixture.build(&mut hud);
-        assert!(fixture.overlay.visible_rows().len() < fixture.overlay.rows().len());
-        let panel_width = PALETTE_WIDTH.min(VIEW_WIDTH - 8.0);
-        let panel_x = (VIEW_WIDTH - panel_width) * 0.5;
-        let list_top = PALETTE_TOP + PANEL_PAD + PANEL_ROW_HEIGHT + EDGE_THICKNESS;
-        assert_eq!(
-            hud.hit(panel_x + panel_width - 0.001, list_top),
-            Target::Scrollbar(Region::Panel)
-        );
-        assert_eq!(
-            hud.hit(panel_x + panel_width - SCROLLBAR_WIDTH - 0.001, list_top),
-            Target::PanelRow(0)
-        );
-    }
-
-    #[test]
-    fn palette_selection_follows_the_overlay() {
-        let mut fixture = Fixture::new("palette-selection");
-        fixture.overlay.open(Panel::WorkspaceSymbols);
-        let rows: Vec<Row> = (0..4)
-            .map(|index| sample_row(&format!("symbole{}", index), "detail"))
-            .collect();
-        fixture.overlay.set_rows(rows);
-        fixture.overlay.move_selection(2);
-        let mut hud = Hud::new();
-        fixture.build(&mut hud);
-        let counter = hud
+        let line = hud
             .labels()
             .iter()
-            .find(|label| label.text.contains(" sur "))
-            .expect("compteur de palette");
-        assert_eq!(counter.text, "3 sur 4");
+            .find(|label| label.surface == Surface::Results && label.text.contains(".rs:"))
+            .expect("ligne de resultat au plafond");
+        assert!(line.text.contains("fn"));
+        let note = hud
+            .labels()
+            .iter()
+            .find(|label| label.surface == Surface::Results && label.text.ends_with(" resultats"))
+            .expect("resume de recherche");
+        assert!(note.text.starts_with("fn  "));
+
+        fixture.overlay.open(Panel::References);
+        fixture
+            .overlay
+            .set_rows(vec![sample_row("appel", "src/main.rs:3")]);
+        fixture.build(&mut hud);
+        assert_eq!(
+            hud.hit_surface(Surface::Results, 2.0, HEADER_HEIGHT),
+            Target::PanelRow(0)
+        );
+        let title = hud
+            .labels()
+            .iter()
+            .any(|label| label.surface == Surface::Results && label.text == "references");
+        assert!(title);
     }
 
     #[test]
@@ -1672,23 +2549,31 @@ mod tests {
 
         let mut hud = Hud::new();
         fixture.build(&mut hud);
-        let output_top = VIEW_HEIGHT - STATUS_HEIGHT - OUTPUT_HEIGHT;
-        let list_top = output_top + OUTPUT_HEADER_HEIGHT;
-        let middle = VIEW_WIDTH * 0.5;
-        assert_eq!(hud.hit(middle, list_top), Target::OutputLine(0));
+        let middle = DECK_WIDTH * 0.5;
         assert_eq!(
-            hud.hit(middle, list_top + OUTPUT_ROW_HEIGHT - 0.001),
+            hud.hit_surface(Surface::Output, middle, HEADER_HEIGHT),
             Target::OutputLine(0)
         );
         assert_eq!(
-            hud.hit(middle, list_top + OUTPUT_ROW_HEIGHT),
+            hud.hit_surface(
+                Surface::Output,
+                middle,
+                HEADER_HEIGHT + OUTPUT_ROW_HEIGHT - 0.001
+            ),
+            Target::OutputLine(0)
+        );
+        assert_eq!(
+            hud.hit_surface(Surface::Output, middle, HEADER_HEIGHT + OUTPUT_ROW_HEIGHT),
             Target::OutputLine(1)
         );
-        assert_eq!(hud.hit(middle, list_top - 0.001), Target::None);
-        assert_eq!(hud.hit(1.0, list_top), Target::OutputLine(0));
-        assert_eq!(hud.region_at(middle, list_top), Some(Region::Output));
-        assert_eq!(hud.region_at(middle, output_top - 0.001), None);
-        assert_eq!(hud.region_at(1.0, output_top - 0.001), Some(Region::Tree));
+        assert_eq!(
+            hud.hit_surface(Surface::Output, middle, HEADER_HEIGHT - 0.001),
+            Target::None
+        );
+        assert_eq!(
+            hud.hit_surface(Surface::Output, 1.0, HEADER_HEIGHT),
+            Target::OutputLine(0)
+        );
     }
 
     #[test]
@@ -1701,6 +2586,191 @@ mod tests {
     }
 
     #[test]
+    fn an_idle_output_deck_keeps_only_its_title_plate() {
+        let fixture = Fixture::new("sortie-inactive");
+        let mut hud = Hud::new();
+        fixture.build(&mut hud);
+        let plate = hud
+            .quads()
+            .iter()
+            .filter(|quad| quad.surface == Surface::Output && quad.color == PANEL_FILL)
+            .max_by(|left, right| {
+                left.rect
+                    .h
+                    .partial_cmp(&right.rect.h)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .expect("plaque de sortie");
+        assert!((plate.rect.h - HEADER_HEIGHT).abs() < SLACK);
+        let state = hud
+            .labels()
+            .iter()
+            .find(|label| label.surface == Surface::Output && label.text == "inactif");
+        assert!(state.is_some());
+    }
+
+    #[test]
+    fn peripheral_hints_ride_on_the_screen_layer() {
+        let mut fixture = Fixture::new("indices");
+        fixture.hints = vec![
+            Quad {
+                rect: Rect::new(0.0, 0.0, 0.6, VIEW_HEIGHT),
+                color: [126, 210, 160, 240],
+                layer: 6,
+                surface: Surface::Screen,
+            },
+            Quad {
+                rect: Rect::new(0.0, 0.0, 0.0, VIEW_HEIGHT),
+                color: [232, 104, 104, 240],
+                layer: 6,
+                surface: Surface::Screen,
+            },
+        ];
+        let mut hud = Hud::new();
+        fixture.build(&mut hud);
+        let bands: Vec<&Quad> = hud
+            .quads()
+            .iter()
+            .filter(|quad| quad.layer == 6 && quad.surface == Surface::Screen)
+            .collect();
+        assert_eq!(bands.len(), 1);
+        assert_eq!(bands[0].color, [126, 210, 160, 240]);
+        assert_eq!(hud.hit_screen(0.2, 4.0), Target::Editor);
+        fixture.hints.clear();
+        fixture.build(&mut hud);
+        assert!(hud.quads().iter().all(|quad| quad.layer != 6));
+    }
+
+    #[test]
+    fn changes_out_of_sight_are_announced_once() {
+        let mut fixture = Fixture::new("indice");
+        let mut hud = Hud::new();
+        fixture.build(&mut hud);
+        assert!(!hud.changed_since(Surface::Problems));
+        fixture.build(&mut hud);
+        assert!(!hud.changed_since(Surface::Problems));
+        fixture.diagnostics = (7, 0);
+        fixture.build(&mut hud);
+        assert!(hud.changed_since(Surface::Problems));
+        assert!(!hud.changed_since(Surface::Tree));
+        fixture.build(&mut hud);
+        assert!(!hud.changed_since(Surface::Problems));
+    }
+
+    #[test]
+    fn the_editor_takes_the_whole_screen() {
+        let fixture = Fixture::new("zone-editeur");
+        let mut hud = Hud::new();
+        fixture.build(&mut hud);
+        let editor = hud.editor_rect();
+        assert_eq!(editor.x, 0.0);
+        assert_eq!(editor.y, 0.0);
+        assert_eq!(editor.w, VIEW_WIDTH);
+        assert_eq!(editor.h, VIEW_HEIGHT);
+        assert_eq!(hud.hit_screen(1.0, 1.0), Target::Editor);
+        assert_eq!(hud.hit_screen(-1.0, -1.0), Target::None);
+        assert_eq!(hud.hit_screen(VIEW_WIDTH, 4.0), Target::None);
+        assert_eq!(
+            hud.hit_surface(Surface::Code, CODE_WIDTH * 0.5, CODE_HEIGHT * 0.5),
+            Target::Editor
+        );
+        assert_eq!(
+            hud.hit_surface(Surface::Code, CODE_WIDTH, CODE_HEIGHT * 0.5),
+            Target::None
+        );
+    }
+
+    #[test]
+    fn palette_rows_are_exact_and_capture_everything_below() {
+        let mut fixture = Fixture::new("palette");
+        fixture.overlay.open(Panel::QuickOpen);
+        let rows: Vec<Row> = (0..6)
+            .map(|index| sample_row(&format!("fichier{}.rs", index), "src"))
+            .collect();
+        fixture.overlay.set_rows(rows);
+        let mut hud = Hud::new();
+        fixture.build(&mut hud);
+
+        let panel_width = PALETTE_WIDTH.min(VIEW_WIDTH - 8.0);
+        let panel_x = (VIEW_WIDTH - panel_width) * 0.5;
+        let list_top = PALETTE_TOP + PANEL_PAD + PANEL_ROW_HEIGHT + EDGE_THICKNESS;
+        let middle = panel_x + panel_width * 0.5;
+
+        assert_eq!(hud.hit_screen(middle, list_top), Target::PanelRow(0));
+        assert_eq!(
+            hud.hit_screen(middle, list_top + PANEL_ROW_HEIGHT - 0.001),
+            Target::PanelRow(0)
+        );
+        assert_eq!(
+            hud.hit_screen(middle, list_top + PANEL_ROW_HEIGHT),
+            Target::PanelRow(1)
+        );
+        assert_eq!(
+            hud.hit_screen(middle, list_top + PANEL_ROW_HEIGHT * 5.0),
+            Target::PanelRow(5)
+        );
+        assert_eq!(
+            hud.hit_screen(middle, list_top + PANEL_ROW_HEIGHT * 6.0),
+            Target::None
+        );
+        assert_eq!(hud.hit_screen(panel_x, list_top), Target::PanelRow(0));
+        assert_eq!(hud.hit_screen(panel_x - 0.001, list_top), Target::Editor);
+        assert_eq!(
+            hud.hit_screen(panel_x + panel_width - 0.001, list_top),
+            Target::PanelRow(0)
+        );
+        assert_eq!(
+            hud.hit_screen(panel_x + panel_width, list_top),
+            Target::Editor
+        );
+        assert_eq!(hud.hit_screen(middle, PALETTE_TOP), Target::None);
+    }
+
+    #[test]
+    fn palette_scrollbar_appears_when_rows_overflow() {
+        let mut fixture = Fixture::new("palette-ascenseur");
+        fixture.overlay.open(Panel::Commands);
+        let rows: Vec<Row> = (0..40)
+            .map(|index| sample_row(&format!("commande {}", index), "src/main.rs"))
+            .collect();
+        fixture.overlay.set_rows(rows);
+        let mut hud = Hud::new();
+        fixture.build(&mut hud);
+        assert!(fixture.overlay.visible_rows().len() < fixture.overlay.rows().len());
+        let panel_width = PALETTE_WIDTH.min(VIEW_WIDTH - 8.0);
+        let panel_x = (VIEW_WIDTH - panel_width) * 0.5;
+        let list_top = PALETTE_TOP + PANEL_PAD + PANEL_ROW_HEIGHT + EDGE_THICKNESS;
+        assert_eq!(
+            hud.hit_screen(panel_x + panel_width - 0.001, list_top),
+            Target::Scrollbar(Region::Panel)
+        );
+        assert_eq!(
+            hud.hit_screen(panel_x + panel_width - SCROLLBAR_WIDTH - 0.001, list_top),
+            Target::PanelRow(0)
+        );
+    }
+
+    #[test]
+    fn palette_selection_follows_the_overlay() {
+        let mut fixture = Fixture::new("palette-selection");
+        fixture.overlay.open(Panel::WorkspaceSymbols);
+        let rows: Vec<Row> = (0..4)
+            .map(|index| sample_row(&format!("symbole{}", index), "detail"))
+            .collect();
+        fixture.overlay.set_rows(rows);
+        fixture.overlay.move_selection(2);
+        let mut hud = Hud::new();
+        fixture.build(&mut hud);
+        let counter = hud
+            .labels()
+            .iter()
+            .find(|label| label.text.contains(" sur "))
+            .expect("compteur de palette");
+        assert_eq!(counter.text, "3 sur 4");
+        assert_eq!(counter.surface, Surface::Screen);
+    }
+
+    #[test]
     fn status_zones_answer_the_pointer() {
         let fixture = Fixture::new("etat");
         let mut hud = Hud::new();
@@ -1710,7 +2780,7 @@ mod tests {
         let mut diagnostics = false;
         let mut x = 0.0;
         while x < VIEW_WIDTH {
-            match hud.hit(x, bar_y) {
+            match hud.hit_screen(x, bar_y) {
                 Target::StatusServer => server = true,
                 Target::StatusDiagnostics => diagnostics = true,
                 _ => {}
@@ -1722,7 +2792,7 @@ mod tests {
         let counts = hud
             .labels()
             .iter()
-            .find(|label| label.text.contains("avertissements"))
+            .find(|label| label.surface == Surface::Screen && label.text.contains("avertissements"))
             .expect("compteurs de diagnostics");
         assert_eq!(counts.text, "2 erreurs  3 avertissements");
         let position = hud
@@ -1731,20 +2801,6 @@ mod tests {
             .find(|label| label.text.starts_with("ligne "))
             .expect("position du curseur");
         assert_eq!(position.text, "ligne 5, col 8");
-    }
-
-    #[test]
-    fn regions_drive_the_wheel() {
-        let mut fixture = Fixture::new("molette");
-        fixture.overlay.toggle_output();
-        let mut hud = Hud::new();
-        fixture.build(&mut hud);
-        assert_eq!(hud.region_at(1.0, TAB_BAR_HEIGHT), Some(Region::Tree));
-        assert_eq!(hud.region_at(VIEW_WIDTH * 0.5, TAB_BAR_HEIGHT + 1.0), None);
-        assert_eq!(
-            hud.region_at(VIEW_WIDTH * 0.5, VIEW_HEIGHT - STATUS_HEIGHT - 1.0),
-            Some(Region::Output)
-        );
     }
 
     #[test]
@@ -1759,10 +2815,11 @@ mod tests {
             .expect("nom d onglet");
         assert_eq!(label.text.chars().count(), TAB_NAME_MAX);
         assert!(label.text.ends_with(ELLIPSIS));
+        assert_eq!(label.surface, Surface::Tabs);
     }
 
     #[test]
-    fn hover_card_stays_inside_the_editor() {
+    fn hover_card_stays_inside_the_screen() {
         let mut fixture = Fixture::new("survol");
         fixture.hover = Some(
             "fn calculer(valeur: usize) -> usize\nrend la valeur doublee, avec une phrase assez longue pour forcer le repli sur plusieurs lignes de la carte"
@@ -1776,12 +2833,13 @@ mod tests {
             .iter()
             .find(|quad| quad.layer == LAYER_CARD && quad.color == CARD_FILL)
             .expect("carte de survol");
+        assert_eq!(card.surface, Surface::Screen);
         assert!(card.rect.x >= editor.x);
         assert!(card.rect.right() <= editor.right());
         assert!(card.rect.y >= editor.y);
         assert!(card.rect.bottom() <= editor.bottom());
         assert!(card.rect.w <= CARD_MAX_WIDTH);
-        assert_eq!(hud.hit(card.rect.x, card.rect.y), Target::None);
+        assert_eq!(hud.hit_screen(card.rect.x, card.rect.y), Target::None);
         let lines = hud
             .labels()
             .iter()
@@ -1837,8 +2895,7 @@ mod tests {
         }
         let quads = hud.quads.capacity();
         let labels = hud.labels.capacity();
-        let hits = hud.hits.capacity();
-        let regions = hud.regions.capacity();
+        let zones = hud.zones.capacity();
         let scratch = hud.scratch.capacity();
         let wrap = hud.wrap.capacity();
         let texts: Vec<usize> = hud
@@ -1848,13 +2905,13 @@ mod tests {
             .collect();
         let quad_pointer = hud.quads.as_ptr();
         let label_pointer = hud.labels.as_ptr();
-        for _ in 0..200 {
+        for step in 0..200 {
+            fixture.focus = Vec3::new(step as f32 * 0.5, -(step as f32), 0.0);
             fixture.build(&mut hud);
         }
         assert_eq!(hud.quads.capacity(), quads);
         assert_eq!(hud.labels.capacity(), labels);
-        assert_eq!(hud.hits.capacity(), hits);
-        assert_eq!(hud.regions.capacity(), regions);
+        assert_eq!(hud.zones.capacity(), zones);
         assert_eq!(hud.scratch.capacity(), scratch);
         assert_eq!(hud.wrap.capacity(), wrap);
         assert_eq!(hud.quads.as_ptr(), quad_pointer);
@@ -1900,6 +2957,13 @@ mod tests {
     }
 
     #[test]
+    fn first_line_cuts_at_the_break() {
+        assert_eq!(first_line("une ligne"), "une ligne");
+        assert_eq!(first_line("une ligne\net une autre"), "une ligne");
+        assert_eq!(first_line(""), "");
+    }
+
+    #[test]
     fn narrow_viewport_keeps_the_layout_sane() {
         let fixture = Fixture::new("etroit");
         let mut hud = Hud::new();
@@ -1908,6 +2972,7 @@ mod tests {
                 width: 12.0,
                 height: 8.0,
             },
+            fixture.focus,
             &fixture.model(),
         );
         let editor = hud.editor_rect();
@@ -1917,33 +2982,66 @@ mod tests {
             assert!(quad.rect.w > 0.0);
             assert!(quad.rect.h > 0.0);
         }
-        assert_eq!(hud.hit(-1.0, -1.0), Target::None);
-        assert_eq!(hud.hit(500.0, 500.0), Target::None);
+        assert_eq!(hud.hit_screen(-1.0, -1.0), Target::None);
+        assert_eq!(hud.hit_screen(500.0, 500.0), Target::None);
+        for surface in every_surface() {
+            let basis = hud.basis(surface);
+            assert!(basis.width > 0.0 && basis.height > 0.0);
+        }
     }
 
     #[test]
-    fn scrollbars_answer_when_the_tree_overflows() {
-        let mut fixture = Fixture::new("ascenseur");
-        for index in 0..80 {
-            fs::write(
-                fixture.sandbox.root.join(format!("f{:03}.rs", index)),
-                "fn f() {}\n",
-            )
-            .expect("fichier de test");
-        }
-        fixture.project = Project::open(&fixture.sandbox.root);
+    fn every_piece_of_furniture_stays_inside_its_surface() {
+        let mut fixture = Fixture::new("bornes");
+        fixture.overlay.toggle_output();
+        fixture.overlay.open(Panel::Problems);
+        fixture.overlay.set_rows(
+            (0..30)
+                .map(|index| sample_row(&format!("probleme {}", index), "src/main.rs:1"))
+                .collect(),
+        );
         let mut hud = Hud::new();
         fixture.build(&mut hud);
-        assert_eq!(
-            hud.hit(SIDEBAR_WIDTH - 0.001, TAB_BAR_HEIGHT + 1.0),
-            Target::Scrollbar(Region::Tree)
-        );
-        assert_eq!(
-            hud.hit(
-                SIDEBAR_WIDTH - SCROLLBAR_WIDTH - 0.001,
-                TAB_BAR_HEIGHT + 1.0
-            ),
-            Target::TreeRow(0)
-        );
+        for quad in hud.quads() {
+            if quad.surface == Surface::Screen {
+                continue;
+            }
+            let basis = hud.basis(quad.surface);
+            assert!(
+                quad.rect.x >= -PANEL_EDGE_WIDTH - SLACK,
+                "{:?} deborde a gauche",
+                quad.surface
+            );
+            assert!(
+                quad.rect.right() <= basis.width + PANEL_EDGE_WIDTH + SLACK,
+                "{:?} deborde a droite",
+                quad.surface
+            );
+            assert!(
+                quad.rect.y >= -PANEL_EDGE_WIDTH - SLACK,
+                "{:?} deborde en haut",
+                quad.surface
+            );
+            assert!(
+                quad.rect.bottom() <= basis.height + PANEL_EDGE_WIDTH + SLACK,
+                "{:?} deborde en bas",
+                quad.surface
+            );
+        }
+        for label in hud.labels() {
+            if label.surface == Surface::Screen {
+                continue;
+            }
+            let basis = hud.basis(label.surface);
+            let width = label.text.chars().count() as f32 * CHAR_WIDTH;
+            assert!(label.x >= 0.0);
+            assert!(
+                label.x + width <= basis.width + SLACK,
+                "texte hors de {:?}: {}",
+                label.surface,
+                label.text
+            );
+            assert!(label.y >= 0.0 && label.y <= basis.height + SLACK);
+        }
     }
 }

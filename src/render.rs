@@ -11,7 +11,7 @@ use crate::camera::Camera;
 use crate::complete::{Completion, VISIBLE_ROWS};
 use crate::extrude::Vertex;
 use crate::font::Font;
-use crate::hud::{Hud, HudViewport, Label, Quad};
+use crate::hud::{Basis, Hud, HudViewport, Label, Quad, Surface};
 use crate::layout::LineLayout;
 use crate::lsp::protocol::Severity;
 use crate::syntax::{Highlighter, STYLE_COLORS, STYLE_TEXT};
@@ -71,6 +71,19 @@ const HUD_LAYERS: usize = 8;
 const HUD_LAYER_STEP: f32 = 0.4;
 const HUD_TEXT_LIFT: f32 = 0.16;
 
+const SURFACE_SLOTS: usize = 6;
+const WORLD_SURFACES: [Surface; SURFACE_SLOTS] = [
+    Surface::Code,
+    Surface::Tabs,
+    Surface::Tree,
+    Surface::Problems,
+    Surface::Output,
+    Surface::Results,
+];
+const WORLD_LAYER_STEP: f32 = 0.03;
+const WORLD_TEXT_LIFT: f32 = 0.145;
+const ROOM_FOG_REACH: f32 = 4.0;
+
 const GUTTER_GAP: f32 = 0.9;
 const GUTTER_MARK_GAP: f32 = 0.34;
 const GUTTER_MARK_WIDTH: f32 = 0.26;
@@ -95,6 +108,7 @@ const FNV_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
 const INSTANCE_SIZE: u64 = std::mem::size_of::<Instance>() as u64;
+const WORLD_INSTANCE_SIZE: u64 = std::mem::size_of::<WorldInstance>() as u64;
 const PANEL_VERTEX_SIZE: u64 = std::mem::size_of::<PanelVertex>() as u64;
 
 #[repr(C)]
@@ -117,6 +131,8 @@ struct Globals {
     screen_right: [f32; 4],
     screen_up: [f32; 4],
     hud: [f32; 4],
+    room: [f32; 4],
+    surfaces: [[f32; 4]; SURFACE_SLOTS * 3],
 }
 
 #[repr(C)]
@@ -133,6 +149,73 @@ impl Instance {
         scale: [0.0; 2],
         color: [0; 4],
     };
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct WorldInstance {
+    offset: [f32; 3],
+    scale: [f32; 2],
+    color: [u8; 4],
+    surface: u32,
+}
+
+impl WorldInstance {
+    const ZERO: WorldInstance = WorldInstance {
+        offset: [0.0; 3],
+        scale: [0.0; 2],
+        color: [0; 4],
+        surface: 0,
+    };
+}
+
+#[derive(Clone, Copy)]
+struct SurfaceFrame {
+    right: Vec3,
+    up: Vec3,
+    face: Vec3,
+    origin: Vec3,
+    center: Vec3,
+    radius: f32,
+}
+
+impl SurfaceFrame {
+    const FLAT: SurfaceFrame = SurfaceFrame {
+        right: Vec3::X,
+        up: Vec3::Y,
+        face: Vec3::Z,
+        origin: Vec3::ZERO,
+        center: Vec3::ZERO,
+        radius: 0.0,
+    };
+
+    fn of(basis: &Basis) -> SurfaceFrame {
+        let right = basis.right.normalize_or(Vec3::X);
+        let down = (basis.down - right * basis.down.dot(right)).normalize_or(Vec3::NEG_Y);
+        let face = down.cross(right).normalize_or(Vec3::Z);
+        let width = basis.width.max(0.0);
+        let height = basis.height.max(0.0);
+        let mut frame = SurfaceFrame {
+            right,
+            up: -down,
+            face,
+            origin: basis.origin,
+            center: basis.origin,
+            radius: (width * width + height * height).sqrt() * 0.5,
+        };
+        frame.center = frame.world(Vec3::new(width * 0.5, -height * 0.5, 0.0));
+        frame
+    }
+
+    fn world(&self, local: Vec3) -> Vec3 {
+        self.origin + self.right * local.x + self.up * local.y + self.face * local.z
+    }
+
+    fn pack(&self, out: &mut [[f32; 4]]) {
+        out[0] = [self.right.x, self.right.y, self.right.z, self.origin.x];
+        out[1] = [self.up.x, self.up.y, self.up.z, self.origin.y];
+        out[2] = [self.face.x, self.face.y, self.face.z, self.origin.z];
+    }
 }
 
 #[repr(C)]
@@ -186,10 +269,10 @@ pub struct SceneMesh {
     pub groups: Vec<MeshGroup>,
 }
 
-struct InstanceSet {
-    values: Vec<Instance>,
+struct InstanceSet<T: Pod> {
+    values: Vec<T>,
     offsets: Vec<u32>,
-    scratch: Vec<(u32, Instance)>,
+    scratch: Vec<(u32, T)>,
     cursors: Vec<u32>,
     buffer: wgpu::Buffer,
     capacity: u32,
@@ -198,8 +281,8 @@ struct InstanceSet {
     label: &'static str,
 }
 
-impl InstanceSet {
-    fn new(device: &wgpu::Device, label: &'static str) -> InstanceSet {
+impl<T: Pod> InstanceSet<T> {
+    fn new(device: &wgpu::Device, label: &'static str) -> InstanceSet<T> {
         InstanceSet {
             values: Vec::new(),
             offsets: Vec::new(),
@@ -207,7 +290,7 @@ impl InstanceSet {
             cursors: Vec::new(),
             buffer: device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(label),
-                size: INSTANCE_SIZE * 64,
+                size: stride::<T>() * 64,
                 usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             }),
@@ -238,7 +321,7 @@ impl InstanceSet {
         }
 
         self.values.clear();
-        self.values.resize(self.scratch.len(), Instance::ZERO);
+        self.values.resize(self.scratch.len(), T::zeroed());
         self.cursors.clear();
         self.cursors.extend_from_slice(&self.offsets);
         for (slot, instance) in &self.scratch {
@@ -260,37 +343,31 @@ impl InstanceSet {
     }
 
     fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
-        if self.values.is_empty() {
-            return;
-        }
-        let needed = self.values.len() as u32;
-        if needed > self.capacity {
-            self.capacity = needed.next_power_of_two();
-            self.buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(self.label),
-                size: u64::from(self.capacity) * INSTANCE_SIZE,
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-        }
-        queue.write_buffer(&self.buffer, 0, bytemuck::cast_slice(&self.values));
+        grow_and_write(
+            device,
+            queue,
+            &mut self.buffer,
+            &mut self.capacity,
+            self.label,
+            &self.values,
+        );
     }
 }
 
-struct FlatInstances {
-    values: Vec<Instance>,
+struct FlatInstances<T: Pod> {
+    values: Vec<T>,
     buffer: wgpu::Buffer,
     capacity: u32,
     label: &'static str,
 }
 
-impl FlatInstances {
-    fn new(device: &wgpu::Device, label: &'static str) -> FlatInstances {
+impl<T: Pod> FlatInstances<T> {
+    fn new(device: &wgpu::Device, label: &'static str) -> FlatInstances<T> {
         FlatInstances {
             values: Vec::new(),
             buffer: device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(label),
-                size: INSTANCE_SIZE * 64,
+                size: stride::<T>() * 64,
                 usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             }),
@@ -300,21 +377,43 @@ impl FlatInstances {
     }
 
     fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
-        if self.values.is_empty() {
-            return;
-        }
-        let needed = self.values.len() as u32;
-        if needed > self.capacity {
-            self.capacity = needed.next_power_of_two();
-            self.buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(self.label),
-                size: u64::from(self.capacity) * INSTANCE_SIZE,
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-        }
-        queue.write_buffer(&self.buffer, 0, bytemuck::cast_slice(&self.values));
+        grow_and_write(
+            device,
+            queue,
+            &mut self.buffer,
+            &mut self.capacity,
+            self.label,
+            &self.values,
+        );
     }
+}
+
+const fn stride<T>() -> u64 {
+    std::mem::size_of::<T>() as u64
+}
+
+fn grow_and_write<T: Pod>(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    buffer: &mut wgpu::Buffer,
+    capacity: &mut u32,
+    label: &'static str,
+    values: &[T],
+) {
+    if values.is_empty() {
+        return;
+    }
+    let needed = values.len() as u32;
+    if needed > *capacity {
+        *capacity = needed.next_power_of_two();
+        *buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: u64::from(*capacity) * stride::<T>(),
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+    }
+    queue.write_buffer(buffer, 0, bytemuck::cast_slice(values));
 }
 
 struct HudRange {
@@ -369,20 +468,14 @@ impl LayeredText {
     }
 
     fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
-        if self.values.is_empty() {
-            return;
-        }
-        let needed = self.values.len() as u32;
-        if needed > self.capacity {
-            self.capacity = needed.next_power_of_two();
-            self.buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(self.label),
-                size: u64::from(self.capacity) * INSTANCE_SIZE,
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-        }
-        queue.write_buffer(&self.buffer, 0, bytemuck::cast_slice(&self.values));
+        grow_and_write(
+            device,
+            queue,
+            &mut self.buffer,
+            &mut self.capacity,
+            self.label,
+            &self.values,
+        );
     }
 }
 
@@ -421,20 +514,14 @@ impl PanelMesh {
     }
 
     fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
-        if self.vertices.is_empty() {
-            return;
-        }
-        let needed = self.vertices.len() as u32;
-        if needed > self.capacity {
-            self.capacity = needed.next_power_of_two();
-            self.buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(self.label),
-                size: u64::from(self.capacity) * PANEL_VERTEX_SIZE,
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-        }
-        queue.write_buffer(&self.buffer, 0, bytemuck::cast_slice(&self.vertices));
+        grow_and_write(
+            device,
+            queue,
+            &mut self.buffer,
+            &mut self.capacity,
+            self.label,
+            &self.vertices,
+        );
     }
 }
 
@@ -466,6 +553,7 @@ struct GlyphPass<'a> {
     fragment_entry: &'a str,
     blend: Option<wgpu::BlendState>,
     depth_write: bool,
+    depth_compare: wgpu::CompareFunction,
 }
 
 pub struct Renderer {
@@ -485,6 +573,8 @@ pub struct Renderer {
     find_pipeline: wgpu::RenderPipeline,
     hud_quad_pipeline: wgpu::RenderPipeline,
     hud_text_pipeline: wgpu::RenderPipeline,
+    world_quad_pipeline: wgpu::RenderPipeline,
+    world_text_pipeline: wgpu::RenderPipeline,
     panel_pipeline: wgpu::RenderPipeline,
     find_panel_pipeline: wgpu::RenderPipeline,
     grid_pipeline: wgpu::RenderPipeline,
@@ -499,13 +589,15 @@ pub struct Renderer {
     popup_panel: PanelMesh,
     find_panel: PanelMesh,
 
-    text_instances: InstanceSet,
-    popup_instances: InstanceSet,
-    find_instances: InstanceSet,
-    highlights: FlatInstances,
-    marks: FlatInstances,
-    hud_quads: FlatInstances,
+    text_instances: InstanceSet<Instance>,
+    popup_instances: InstanceSet<Instance>,
+    find_instances: InstanceSet<Instance>,
+    highlights: FlatInstances<Instance>,
+    marks: FlatInstances<Instance>,
+    hud_quads: FlatInstances<Instance>,
     hud_text: LayeredText,
+    world_quads: FlatInstances<WorldInstance>,
+    world_text: InstanceSet<WorldInstance>,
 
     depth_view: wgpu::TextureView,
     msaa_view: Option<wgpu::TextureView>,
@@ -520,6 +612,8 @@ pub struct Renderer {
     diagnostics: Vec<DiagnosticSpan>,
     gutter: Vec<GutterMark>,
     hud_quad_layers: [u32; HUD_LAYERS + 1],
+    frames: [SurfaceFrame; SURFACE_SLOTS],
+    frames_used: [bool; SURFACE_SLOTS],
     hud_key: u64,
     diagnostics_key: u64,
     gutter_key: u64,
@@ -740,6 +834,7 @@ impl Renderer {
                 fragment_entry: "fs_main",
                 blend: None,
                 depth_write: true,
+                depth_compare: wgpu::CompareFunction::Less,
             },
         );
         let highlight_pipeline = make_glyph_pipeline(
@@ -755,6 +850,7 @@ impl Renderer {
                 fragment_entry: "fs_flat",
                 blend: Some(wgpu::BlendState::ALPHA_BLENDING),
                 depth_write: false,
+                depth_compare: wgpu::CompareFunction::Less,
             },
         );
         let popup_pipeline = make_glyph_pipeline(
@@ -770,6 +866,7 @@ impl Renderer {
                 fragment_entry: "fs_main",
                 blend: None,
                 depth_write: true,
+                depth_compare: wgpu::CompareFunction::Less,
             },
         );
         let find_pipeline = make_glyph_pipeline(
@@ -785,6 +882,7 @@ impl Renderer {
                 fragment_entry: "fs_main",
                 blend: None,
                 depth_write: true,
+                depth_compare: wgpu::CompareFunction::Less,
             },
         );
 
@@ -801,6 +899,7 @@ impl Renderer {
                 fragment_entry: "fs_hud_flat",
                 blend: Some(wgpu::BlendState::ALPHA_BLENDING),
                 depth_write: false,
+                depth_compare: wgpu::CompareFunction::Less,
             },
         );
         let hud_text_pipeline = make_glyph_pipeline(
@@ -816,6 +915,54 @@ impl Renderer {
                 fragment_entry: "fs_hud",
                 blend: Some(wgpu::BlendState::ALPHA_BLENDING),
                 depth_write: true,
+                depth_compare: wgpu::CompareFunction::Less,
+            },
+        );
+
+        let world_attributes =
+            wgpu::vertex_attr_array![2 => Float32x3, 3 => Float32x2, 4 => Unorm8x4, 5 => Uint32];
+        let world_buffers = [
+            Some(wgpu::VertexBufferLayout {
+                array_stride: std::mem::size_of::<Vertex>() as u64,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &mesh_attributes,
+            }),
+            Some(wgpu::VertexBufferLayout {
+                array_stride: WORLD_INSTANCE_SIZE,
+                step_mode: wgpu::VertexStepMode::Instance,
+                attributes: &world_attributes,
+            }),
+        ];
+        let world_quad_pipeline = make_glyph_pipeline(
+            &device,
+            &lit_layout,
+            &glyph_shader,
+            &world_buffers,
+            format,
+            multisample,
+            GlyphPass {
+                label: "world-quad-pipeline",
+                vertex_entry: "vs_world",
+                fragment_entry: "fs_world_plate",
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                depth_write: true,
+                depth_compare: wgpu::CompareFunction::LessEqual,
+            },
+        );
+        let world_text_pipeline = make_glyph_pipeline(
+            &device,
+            &lit_layout,
+            &glyph_shader,
+            &world_buffers,
+            format,
+            multisample,
+            GlyphPass {
+                label: "world-text-pipeline",
+                vertex_entry: "vs_world",
+                fragment_entry: "fs_world",
+                blend: None,
+                depth_write: true,
+                depth_compare: wgpu::CompareFunction::Less,
             },
         );
 
@@ -939,6 +1086,8 @@ impl Renderer {
             marks: FlatInstances::new(&device, "mark-instances"),
             hud_quads: FlatInstances::new(&device, "hud-quad-instances"),
             hud_text: LayeredText::new(&device, "hud-text-instances"),
+            world_quads: FlatInstances::new(&device, "world-quad-instances"),
+            world_text: InstanceSet::new(&device, "world-text-instances"),
             popup_panel: PanelMesh::new(&device, "popup-panel"),
             find_panel: PanelMesh::new(&device, "find-panel"),
             surface,
@@ -956,6 +1105,8 @@ impl Renderer {
             find_pipeline,
             hud_quad_pipeline,
             hud_text_pipeline,
+            world_quad_pipeline,
+            world_text_pipeline,
             panel_pipeline,
             find_panel_pipeline,
             grid_pipeline,
@@ -976,6 +1127,8 @@ impl Renderer {
             diagnostics: Vec::new(),
             gutter: Vec::new(),
             hud_quad_layers: [0; HUD_LAYERS + 1],
+            frames: [SurfaceFrame::FLAT; SURFACE_SLOTS],
+            frames_used: [false; SURFACE_SLOTS],
             hud_key: 0,
             diagnostics_key: 0,
             gutter_key: 0,
@@ -1055,7 +1208,10 @@ impl Renderer {
         self.marks.values.clear();
         self.hud_quads.values.clear();
         self.hud_text.discard();
+        self.world_quads.values.clear();
+        self.world_text.discard();
         self.hud_quad_layers = [0; HUD_LAYERS + 1];
+        self.frames_used = [false; SURFACE_SLOTS];
         self.hud_key = 0;
         self.wants_rebuild = true;
         self.popup_panel.vertices.clear();
@@ -1072,22 +1228,29 @@ impl Renderer {
         let highlight_count = self.highlights.values.len() as u32;
         let mark_count = self.marks.values.len() as u32;
         let hud_quad_count = self.hud_quads.values.len() as u32;
-        let flat_count = highlight_count + mark_count + hud_quad_count;
+        let world_quad_count = self.world_quads.values.len() as u32;
+        let flat_count = highlight_count + mark_count + hud_quad_count + world_quad_count;
         let instances = self.text_instances.values.len() as u32
             + self.popup_instances.values.len() as u32
             + self.find_instances.values.len() as u32
             + self.hud_text.values.len() as u32
+            + self.world_text.values.len() as u32
             + flat_count
             + 1;
         let triangles = self.text_instances.triangles
             + self.popup_instances.triangles
             + self.find_instances.triangles
             + self.hud_text.triangles
+            + self.world_text.triangles
             + flat_count * (quad.index_count / 3)
             + cursor.index_count / 3;
         let mut draws = 2 + self.text_instances.draws;
         draws += self.popup_instances.draws + self.find_instances.draws;
         draws += self.hud_text.ranges.len() as u32;
+        draws += self.world_text.draws;
+        if world_quad_count > 0 {
+            draws += 1;
+        }
         for layer in 0..HUD_LAYERS {
             if self.hud_quad_layers[layer] < self.hud_quad_layers[layer + 1] {
                 draws += 1;
@@ -1626,6 +1789,10 @@ impl Renderer {
     }
 
     pub fn set_hud(&mut self, hud: &Hud, font: &Font) {
+        for (slot, surface) in WORLD_SURFACES.iter().enumerate() {
+            self.frames[slot] = SurfaceFrame::of(&hud.basis(*surface));
+        }
+
         let quads = hud.quads();
         let labels = hud.labels();
         let key = hud_fingerprint(quads, labels);
@@ -1633,29 +1800,49 @@ impl Renderer {
             return;
         }
         self.hud_key = key;
+        self.frames_used = [false; SURFACE_SLOTS];
 
         build_hud_quads(
             quads,
             font.line_height(),
             &mut self.hud_quads.values,
             &mut self.hud_quad_layers,
+            &mut self.world_quads.values,
+            &mut self.frames_used,
         );
 
         self.hud_text.scratch.clear();
+        self.world_text.scratch.clear();
         for label in labels {
-            push_hud_label(
-                &mut self.atlas,
-                &mut self.layout,
-                font,
-                label,
-                &mut self.hud_text.scratch,
-            );
+            match surface_slot(label.surface) {
+                Some(slot) => {
+                    self.frames_used[slot] = true;
+                    push_world_label(
+                        &mut self.atlas,
+                        &mut self.layout,
+                        font,
+                        label,
+                        slot,
+                        &mut self.world_text.scratch,
+                    );
+                }
+                None => push_hud_label(
+                    &mut self.atlas,
+                    &mut self.layout,
+                    font,
+                    label,
+                    &mut self.hud_text.scratch,
+                ),
+            }
         }
         self.hud_text.group(&self.atlas.slots);
+        self.world_text.group(&self.atlas.slots);
 
         self.upload_atlas();
         self.hud_quads.upload(&self.device, &self.queue);
         self.hud_text.upload(&self.device, &self.queue);
+        self.world_quads.upload(&self.device, &self.queue);
+        self.world_text.upload(&self.device, &self.queue);
     }
 
     fn upload_atlas(&mut self) {
@@ -1985,6 +2172,17 @@ impl Renderer {
         };
         let hud = hud_ndc(HUD_EM_HEIGHT * ratio.max(0.01), HUD_EM_HEIGHT);
 
+        let mut surfaces = [[0.0f32; 4]; SURFACE_SLOTS * 3];
+        let mut room_radius = 0.0f32;
+        for (slot, frame) in self.frames.iter().enumerate() {
+            frame.pack(&mut surfaces[slot * 3..slot * 3 + 3]);
+            if self.frames_used[slot] {
+                room_radius = room_radius.max(camera.target.distance(frame.center) + frame.radius);
+            }
+        }
+        let fog_room = room_fog(fog_start, fog_end, room_radius);
+        let room = [fog_room[0], fog_room[1], 0.0, 0.0];
+
         let globals = Globals {
             view_proj: camera.view_proj(aspect).to_cols_array_2d(),
             light_view_proj: light_view_proj.to_cols_array_2d(),
@@ -2018,6 +2216,8 @@ impl Renderer {
             screen_right: [right.x, right.y, right.z, 0.0],
             screen_up: [up.x, up.y, up.z, 0.0],
             hud,
+            room,
+            surfaces,
         };
         self.queue
             .write_buffer(&self.globals, 0, bytemuck::bytes_of(&globals));
@@ -2139,6 +2339,8 @@ impl Renderer {
                 pass.set_vertex_buffer(1, self.popup_instances.buffer.slice(..));
                 draw_groups(&mut pass, &self.atlas, &self.popup_instances.offsets);
             }
+
+            self.encode_world(&mut pass);
         }
 
         if grid {
@@ -2167,6 +2369,24 @@ impl Renderer {
         }
 
         self.encode_hud(&mut pass);
+    }
+
+    fn encode_world(&self, pass: &mut wgpu::RenderPass<'_>) {
+        if !self.world_quads.values.is_empty() {
+            let quad = &self.atlas.slots[self.atlas.quad_slot() as usize];
+            pass.set_pipeline(&self.world_quad_pipeline);
+            pass.set_vertex_buffer(1, self.world_quads.buffer.slice(..));
+            pass.draw_indexed(
+                quad.index_start..quad.index_start + quad.index_count,
+                quad.base_vertex,
+                0..self.world_quads.values.len() as u32,
+            );
+        }
+        if !self.world_text.values.is_empty() {
+            pass.set_pipeline(&self.world_text_pipeline);
+            pass.set_vertex_buffer(1, self.world_text.buffer.slice(..));
+            draw_groups(pass, &self.atlas, &self.world_text.offsets);
+        }
     }
 
     fn encode_hud(&self, pass: &mut wgpu::RenderPass<'_>) {
@@ -2334,6 +2554,10 @@ fn hud_ndc(width: f32, height: f32) -> [f32; 4] {
     ]
 }
 
+fn room_fog(fog_start: f32, fog_end: f32, radius: f32) -> [f32; 2] {
+    [fog_start.max(radius), fog_end.max(radius * ROOM_FOG_REACH)]
+}
+
 fn hud_layer(layer: u8) -> usize {
     (layer as usize).min(HUD_LAYERS - 1)
 }
@@ -2357,30 +2581,92 @@ fn hud_quad_instance(quad: &Quad, line_height: f32) -> Instance {
     }
 }
 
+fn surface_slot(surface: Surface) -> Option<usize> {
+    match surface {
+        Surface::Code => Some(0),
+        Surface::Tabs => Some(1),
+        Surface::Tree => Some(2),
+        Surface::Problems => Some(3),
+        Surface::Output => Some(4),
+        Surface::Results => Some(5),
+        Surface::Screen => None,
+    }
+}
+
+fn surface_byte(surface: Surface) -> u8 {
+    match surface_slot(surface) {
+        Some(slot) => slot as u8,
+        None => u8::MAX,
+    }
+}
+
+fn world_quad_instance(quad: &Quad, line_height: f32, slot: usize) -> WorldInstance {
+    let layer = hud_layer(quad.layer);
+    let width = quad.rect.w.max(0.0);
+    let height = quad.rect.h.max(0.0);
+    WorldInstance {
+        offset: [
+            quad.rect.x,
+            -(quad.rect.y + height),
+            layer as f32 * WORLD_LAYER_STEP,
+        ],
+        scale: [width, height / line_height.max(1e-4)],
+        color: quad.color,
+        surface: slot as u32,
+    }
+}
+
 fn build_hud_quads(
     quads: &[Quad],
     line_height: f32,
-    out: &mut Vec<Instance>,
+    screen: &mut Vec<Instance>,
     layers: &mut [u32; HUD_LAYERS + 1],
+    world: &mut Vec<WorldInstance>,
+    used: &mut [bool; SURFACE_SLOTS],
 ) {
-    let mut counts = [0u32; HUD_LAYERS];
-    for quad in quads {
-        counts[hud_layer(quad.layer)] += 1;
-    }
-    layers[0] = 0;
-    for index in 0..HUD_LAYERS {
-        layers[index + 1] = layers[index] + counts[index];
-    }
-
-    out.clear();
-    out.resize(quads.len(), Instance::ZERO);
-    let mut cursors = [0u32; HUD_LAYERS];
-    cursors.copy_from_slice(&layers[..HUD_LAYERS]);
+    let mut screen_counts = [0u32; HUD_LAYERS];
+    let mut world_counts = [0u32; HUD_LAYERS];
     for quad in quads {
         let layer = hud_layer(quad.layer);
-        let at = &mut cursors[layer];
-        out[*at as usize] = hud_quad_instance(quad, line_height);
-        *at += 1;
+        match surface_slot(quad.surface) {
+            Some(slot) => {
+                used[slot] = true;
+                world_counts[layer] += 1;
+            }
+            None => screen_counts[layer] += 1,
+        }
+    }
+
+    let mut world_layers = [0u32; HUD_LAYERS + 1];
+    layers[0] = 0;
+    for index in 0..HUD_LAYERS {
+        layers[index + 1] = layers[index] + screen_counts[index];
+        world_layers[index + 1] = world_layers[index] + world_counts[index];
+    }
+
+    screen.clear();
+    screen.resize(layers[HUD_LAYERS] as usize, Instance::ZERO);
+    world.clear();
+    world.resize(world_layers[HUD_LAYERS] as usize, WorldInstance::ZERO);
+
+    let mut screen_cursors = [0u32; HUD_LAYERS];
+    screen_cursors.copy_from_slice(&layers[..HUD_LAYERS]);
+    let mut world_cursors = [0u32; HUD_LAYERS];
+    world_cursors.copy_from_slice(&world_layers[..HUD_LAYERS]);
+    for quad in quads {
+        let layer = hud_layer(quad.layer);
+        match surface_slot(quad.surface) {
+            Some(slot) => {
+                let at = &mut world_cursors[layer];
+                world[*at as usize] = world_quad_instance(quad, line_height, slot);
+                *at += 1;
+            }
+            None => {
+                let at = &mut screen_cursors[layer];
+                screen[*at as usize] = hud_quad_instance(quad, line_height);
+                *at += 1;
+            }
+        }
     }
 }
 
@@ -2406,6 +2692,34 @@ fn push_hud_label(
                 offset: [label.x + placement.x, baseline, z],
                 scale: [1.0, 1.0],
                 color: label.color,
+            },
+        ));
+    }
+}
+
+fn push_world_label(
+    atlas: &mut GlyphAtlas,
+    layout: &mut LineLayout,
+    font: &Font,
+    label: &Label,
+    slot: usize,
+    out: &mut Vec<(u32, WorldInstance)>,
+) {
+    let z = hud_layer(label.layer) as f32 * WORLD_LAYER_STEP + WORLD_TEXT_LIFT;
+    let baseline = -label.y;
+    layout.build(font, &label.text);
+    for placement in &layout.placements {
+        let glyph = atlas.slot_for(font, placement.key, LOD_NEAR);
+        if glyph == BLANK {
+            continue;
+        }
+        out.push((
+            glyph,
+            WorldInstance {
+                offset: [label.x + placement.x, baseline, z],
+                scale: [1.0, 1.0],
+                color: label.color,
+                surface: slot as u32,
             },
         ));
     }
@@ -2471,13 +2785,13 @@ fn hud_fingerprint(quads: &[Quad], labels: &[Label]) -> u64 {
         hash = mix_f32(hash, quad.rect.w);
         hash = mix_f32(hash, quad.rect.h);
         hash = mix_bytes(hash, &quad.color);
-        hash = mix_bytes(hash, &[quad.layer]);
+        hash = mix_bytes(hash, &[quad.layer, surface_byte(quad.surface)]);
     }
     for label in labels {
         hash = mix_f32(hash, label.x);
         hash = mix_f32(hash, label.y);
         hash = mix_bytes(hash, &label.color);
-        hash = mix_bytes(hash, &[label.layer]);
+        hash = mix_bytes(hash, &[label.layer, surface_byte(label.surface)]);
         hash = mix_bytes(hash, label.text.as_bytes());
         hash = mix_bytes(hash, &[0]);
     }
@@ -2688,7 +3002,7 @@ fn make_glyph_pipeline(
             cull_mode: Some(wgpu::Face::Back),
             ..Default::default()
         },
-        depth_stencil: Some(depth_state(pass.depth_write, wgpu::CompareFunction::Less)),
+        depth_stencil: Some(depth_state(pass.depth_write, pass.depth_compare)),
         multisample,
         fragment: Some(wgpu::FragmentState {
             module: shader,
@@ -2835,12 +3149,26 @@ mod tests {
     use crate::hud::Rect;
     use crate::layout::Placement;
 
+    const ROOM_X: f32 = 34.0;
+    const ROOM_Y: f32 = 15.0;
+    const WALL_WIDTH: f32 = 28.0;
+    const WALL_HEIGHT: f32 = 26.0;
+
     fn quad_at(x: f32, y: f32, w: f32, h: f32, layer: u8) -> Quad {
+        on_surface(quad_at_of(x, y, w, h, layer), Surface::Screen)
+    }
+
+    fn quad_at_of(x: f32, y: f32, w: f32, h: f32, layer: u8) -> Quad {
         Quad {
             rect: Rect { x, y, w, h },
             color: [1, 2, 3, 4],
             layer,
+            surface: Surface::Screen,
         }
+    }
+
+    fn on_surface(quad: Quad, surface: Surface) -> Quad {
+        Quad { surface, ..quad }
     }
 
     fn label_at(x: f32, y: f32, text: &str, layer: u8) -> Label {
@@ -2850,7 +3178,36 @@ mod tests {
             text: String::from(text),
             color: [9, 8, 7, 255],
             layer,
+            surface: Surface::Screen,
         }
+    }
+
+    fn wall_basis(center: Vec3, facing: Vec3) -> Basis {
+        let forward = -facing;
+        let right = forward.cross(Vec3::Y).normalize();
+        let down = forward.cross(right);
+        Basis {
+            origin: center - right * (WALL_WIDTH * 0.5) - down * (WALL_HEIGHT * 0.5),
+            right,
+            down,
+            width: WALL_WIDTH,
+            height: WALL_HEIGHT,
+        }
+    }
+
+    fn flat_basis(center: Vec3, right: Vec3, down: Vec3) -> Basis {
+        Basis {
+            origin: center - right * (WALL_WIDTH * 0.5) - down * (WALL_HEIGHT * 0.5),
+            right,
+            down,
+            width: WALL_WIDTH,
+            height: WALL_HEIGHT,
+        }
+    }
+
+    fn smooth_haze(range: [f32; 2], distance: f32) -> f32 {
+        let t = ((distance - range[0]) / (range[1] - range[0])).clamp(0.0, 1.0);
+        t * t * (3.0 - 2.0 * t)
     }
 
     fn marked(x: f32) -> Instance {
@@ -2880,7 +3237,8 @@ mod tests {
 
     #[test]
     fn globals_suit_la_disposition_des_shaders() {
-        assert_eq!(std::mem::size_of::<Globals>(), 368);
+        assert_eq!(std::mem::size_of::<Globals>(), 672);
+        assert_eq!(std::mem::size_of::<WorldInstance>(), 28);
     }
 
     #[test]
@@ -2918,7 +3276,11 @@ mod tests {
         ];
         let mut out = Vec::new();
         let mut layers = [0u32; HUD_LAYERS + 1];
-        build_hud_quads(&quads, 1.0, &mut out, &mut layers);
+        let mut world = Vec::new();
+        let mut used = [false; SURFACE_SLOTS];
+        build_hud_quads(&quads, 1.0, &mut out, &mut layers, &mut world, &mut used);
+        assert!(world.is_empty());
+        assert_eq!(used, [false; SURFACE_SLOTS]);
         assert_eq!(out.len(), 4);
         assert_eq!(layers[0], 0);
         assert_eq!(layers[1], 1);
@@ -2936,12 +3298,20 @@ mod tests {
     fn quads_hud_reutilisent_le_tampon() {
         let mut out = Vec::new();
         let mut layers = [0u32; HUD_LAYERS + 1];
-        let quads = vec![quad_at(0.0, 0.0, 1.0, 1.0, 0), quad_at(1.0, 0.0, 1.0, 1.0, 0)];
-        build_hud_quads(&quads, 1.0, &mut out, &mut layers);
+        let mut world = Vec::new();
+        let mut used = [false; SURFACE_SLOTS];
+        let quads = vec![
+            quad_at(0.0, 0.0, 1.0, 1.0, 0),
+            on_surface(quad_at_of(1.0, 0.0, 1.0, 1.0, 0), Surface::Tree),
+        ];
+        build_hud_quads(&quads, 1.0, &mut out, &mut layers, &mut world, &mut used);
         let capacity = out.capacity();
-        build_hud_quads(&quads[..1], 1.0, &mut out, &mut layers);
+        let world_capacity = world.capacity();
+        build_hud_quads(&quads[..1], 1.0, &mut out, &mut layers, &mut world, &mut used);
         assert_eq!(out.len(), 1);
         assert_eq!(out.capacity(), capacity);
+        assert!(world.is_empty());
+        assert_eq!(world.capacity(), world_capacity);
         assert_eq!(layers[HUD_LAYERS], 1);
     }
 
@@ -2989,8 +3359,18 @@ mod tests {
             text: String::from("onglets"),
             color: [1, 1, 1, 255],
             layer: 1,
+            surface: Surface::Screen,
         };
         assert_ne!(base, hud_fingerprint(&quads, &[recolore]));
+        let deplace = Label {
+            surface: Surface::Tree,
+            ..labels[0].clone()
+        };
+        assert_ne!(base, hud_fingerprint(&quads, &[deplace]));
+        assert_ne!(
+            base,
+            hud_fingerprint(&[on_surface(quads[0], Surface::Output)], &labels)
+        );
     }
 
     #[test]
@@ -3117,6 +3497,192 @@ mod tests {
         let (left, right) = span_bounds(&layout, 0, 0, 0.6);
         assert_eq!(left, 0.0);
         assert_eq!(right, 0.0);
+    }
+
+
+    #[test]
+    fn les_fentes_de_surface_suivent_la_table() {
+        for (slot, surface) in WORLD_SURFACES.iter().enumerate() {
+            assert_eq!(surface_slot(*surface), Some(slot));
+            assert_eq!(surface_byte(*surface), slot as u8);
+        }
+        assert_eq!(surface_slot(Surface::Screen), None);
+        assert_eq!(surface_byte(Surface::Screen), u8::MAX);
+        assert!(SURFACE_SLOTS * 3 == 18);
+    }
+
+    #[test]
+    fn repere_de_surface_est_direct_et_tourne_vers_le_centre() {
+        let focus = Vec3::new(3.0, -7.0, 0.0);
+        let bases = [
+            wall_basis(focus + Vec3::new(0.0, 0.0, 0.0), Vec3::Z),
+            wall_basis(focus + Vec3::new(-ROOM_X, 0.0, 0.0), Vec3::X),
+            wall_basis(focus + Vec3::new(ROOM_X, 0.0, 0.0), -Vec3::X),
+            flat_basis(focus + Vec3::new(0.0, -ROOM_Y, 0.0), Vec3::X, Vec3::Z),
+            flat_basis(focus + Vec3::new(0.0, ROOM_Y, 0.0), Vec3::X, -Vec3::Z),
+        ];
+        let attendus = [Vec3::Z, Vec3::X, -Vec3::X, Vec3::Y, -Vec3::Y];
+        for (basis, attendu) in bases.iter().zip(attendus) {
+            let frame = SurfaceFrame::of(basis);
+            assert!((frame.right.length() - 1.0).abs() < 1e-5);
+            assert!((frame.up.length() - 1.0).abs() < 1e-5);
+            assert!((frame.face.length() - 1.0).abs() < 1e-5);
+            assert!(frame.right.dot(frame.up).abs() < 1e-5);
+            assert!(frame.right.dot(frame.face).abs() < 1e-5);
+            assert!(frame.up.dot(frame.face).abs() < 1e-5);
+            assert!(frame.right.cross(frame.up).distance(frame.face) < 1e-5);
+            assert!(frame.face.distance(attendu) < 1e-5);
+            let vers_le_centre = focus - frame.center;
+            assert!(frame.face.dot(vers_le_centre) >= -1e-5);
+            assert!((frame.center.distance(frame.origin) - frame.radius).abs() < 1e-4);
+        }
+    }
+
+    #[test]
+    fn le_texte_du_mur_se_lit_dans_le_sens_de_lecture() {
+        let focus = Vec3::new(0.0, 0.0, 0.0);
+        for facing in [Vec3::X, -Vec3::X, Vec3::Z] {
+            let center = focus - facing * ROOM_X;
+            let frame = SurfaceFrame::of(&wall_basis(center, facing));
+            let coin = frame.world(Vec3::ZERO);
+            assert!(coin.distance(frame.origin) < 1e-5);
+
+            let apres = frame.world(Vec3::new(1.0, 0.0, 0.0));
+            assert!((apres - coin).distance(frame.right) < 1e-5);
+
+            let ligne_suivante = frame.world(Vec3::new(0.0, -2.0, 0.0));
+            assert!(ligne_suivante.y < coin.y - 1.0);
+
+            let relief = frame.world(Vec3::new(0.0, 0.0, GLYPH_HALF_DEPTH));
+            assert!(relief.distance(focus) < coin.distance(focus));
+        }
+    }
+
+    #[test]
+    fn le_sol_et_le_plafond_lisent_vers_le_centre() {
+        let focus = Vec3::new(1.0, 2.0, 0.0);
+        let sol = SurfaceFrame::of(&flat_basis(
+            focus + Vec3::new(0.0, -ROOM_Y, 0.0),
+            Vec3::X,
+            Vec3::Z,
+        ));
+        let plafond = SurfaceFrame::of(&flat_basis(
+            focus + Vec3::new(0.0, ROOM_Y, 0.0),
+            Vec3::X,
+            -Vec3::Z,
+        ));
+        assert!(sol.face.distance(Vec3::Y) < 1e-5);
+        assert!(plafond.face.distance(-Vec3::Y) < 1e-5);
+        let releve = sol.world(Vec3::new(0.0, 0.0, GLYPH_HALF_DEPTH));
+        assert!(releve.y > sol.origin.y);
+        let suspendu = plafond.world(Vec3::new(0.0, 0.0, GLYPH_HALF_DEPTH));
+        assert!(suspendu.y < plafond.origin.y);
+    }
+
+    #[test]
+    fn base_empaquetee_se_relit_comme_le_shader() {
+        let frame = SurfaceFrame::of(&wall_basis(Vec3::new(-34.0, 1.0, 2.0), Vec3::X));
+        let mut packed = [[0.0f32; 4]; 3];
+        frame.pack(&mut packed);
+        let right = Vec3::new(packed[0][0], packed[0][1], packed[0][2]);
+        let up = Vec3::new(packed[1][0], packed[1][1], packed[1][2]);
+        let face = Vec3::new(packed[2][0], packed[2][1], packed[2][2]);
+        let origin = Vec3::new(packed[0][3], packed[1][3], packed[2][3]);
+        let local = Vec3::new(2.5, -3.5, 0.1);
+        let monde = origin + right * local.x + up * local.y + face * local.z;
+        assert!(monde.distance(frame.world(local)) < 1e-5);
+    }
+
+    #[test]
+    fn repere_degenere_reste_fini() {
+        let basis = Basis {
+            origin: Vec3::new(1.0, 2.0, 3.0),
+            right: Vec3::ZERO,
+            down: Vec3::ZERO,
+            width: 0.0,
+            height: 0.0,
+        };
+        let frame = SurfaceFrame::of(&basis);
+        assert!(frame.right.is_finite());
+        assert!(frame.up.is_finite());
+        assert!(frame.face.is_finite());
+        assert!(frame.center.is_finite());
+        assert!((frame.right.cross(frame.up).distance(frame.face)) < 1e-5);
+    }
+
+    #[test]
+    fn quad_du_monde_pose_sa_base_en_bas() {
+        let source = on_surface(quad_at_of(3.0, 5.0, 10.0, 2.0, 2), Surface::Tree);
+        let instance = world_quad_instance(&source, 1.25, 2);
+        assert_eq!(instance.offset[0], 3.0);
+        assert_eq!(instance.offset[1], -7.0);
+        assert!((instance.offset[2] - 2.0 * WORLD_LAYER_STEP).abs() < 1e-6);
+        assert_eq!(instance.scale[0], 10.0);
+        assert!((instance.scale[1] - 2.0 / 1.25).abs() < 1e-6);
+        assert_eq!(instance.color, [1, 2, 3, 4]);
+        assert_eq!(instance.surface, 2);
+        let negatif = world_quad_instance(&quad_at_of(0.0, 0.0, -3.0, -2.0, 0), 1.0, 0);
+        assert_eq!(negatif.scale, [0.0, 0.0]);
+    }
+
+    #[test]
+    fn quads_repartis_entre_ecran_et_monde() {
+        let quads = vec![
+            on_surface(quad_at_of(0.0, 0.0, 1.0, 1.0, 4), Surface::Tree),
+            quad_at(1.0, 0.0, 1.0, 1.0, 0),
+            on_surface(quad_at_of(2.0, 0.0, 1.0, 1.0, 5), Surface::Output),
+            on_surface(quad_at_of(3.0, 0.0, 1.0, 1.0, 4), Surface::Problems),
+            quad_at(4.0, 0.0, 1.0, 1.0, 1),
+        ];
+        let mut screen = Vec::new();
+        let mut layers = [0u32; HUD_LAYERS + 1];
+        let mut world = Vec::new();
+        let mut used = [false; SURFACE_SLOTS];
+        build_hud_quads(&quads, 1.0, &mut screen, &mut layers, &mut world, &mut used);
+
+        assert_eq!(screen.len(), 2);
+        assert_eq!(layers[HUD_LAYERS], 2);
+        assert_eq!(screen[0].offset[0], 1.0);
+        assert_eq!(screen[1].offset[0], 4.0);
+
+        assert_eq!(world.len(), 3);
+        assert_eq!(world[0].offset[0], 0.0);
+        assert_eq!(world[0].surface, 2);
+        assert_eq!(world[1].offset[0], 3.0);
+        assert_eq!(world[1].surface, 3);
+        assert_eq!(world[2].offset[0], 2.0);
+        assert_eq!(world[2].surface, 4);
+
+        assert_eq!(used[2], true);
+        assert_eq!(used[3], true);
+        assert_eq!(used[4], true);
+        assert_eq!(used[0], false);
+        assert_eq!(used[1], false);
+        assert_eq!(used[5], false);
+    }
+
+    #[test]
+    fn le_relief_du_texte_franchit_la_plaque() {
+        assert!(WORLD_TEXT_LIFT > GLYPH_HALF_DEPTH);
+        assert!(WORLD_LAYER_STEP + WORLD_TEXT_LIFT - GLYPH_HALF_DEPTH > 0.01);
+        assert!(WORLD_LAYER_STEP * (HUD_LAYERS as f32) + WORLD_TEXT_LIFT < 0.5);
+    }
+
+    #[test]
+    fn brouillard_de_piece_laisse_lire_un_mur_regarde_en_face() {
+        let base_start = 37.5;
+        let base_end = 126.0;
+        let rayon = 53.0;
+        let range = room_fog(base_start, base_end, rayon);
+        assert!(range[0] >= base_start);
+        assert!(range[1] >= base_end);
+        assert!(smooth_haze(range, 28.0) < 1e-6);
+        assert!(smooth_haze(range, rayon) < 1e-6);
+        assert!(smooth_haze(range, 96.0) < 0.35);
+        let proche = room_fog(4.0, 14.0, 53.0);
+        assert!(smooth_haze(proche, 28.0) < 1e-6);
+        let sans_piece = room_fog(base_start, base_end, 0.0);
+        assert_eq!(sans_piece, [base_start, base_end]);
     }
 
     #[test]

@@ -16,6 +16,8 @@ struct Globals {
     screen_right: vec4<f32>,
     screen_up: vec4<f32>,
     hud: vec4<f32>,
+    room: vec4<f32>,
+    surfaces: array<vec4<f32>, 18>,
 };
 
 @group(0) @binding(0) var<uniform> g: Globals;
@@ -46,6 +48,7 @@ struct VsOut {
     @location(2) color: vec4<f32>,
     @location(3) line_factor: f32,
     @location(4) shadowed: f32,
+    @location(5) fog: vec2<f32>,
 };
 
 @vertex
@@ -64,6 +67,7 @@ fn vs_main(
     out.color = color;
     out.line_factor = placed.line_factor;
     out.shadowed = 1.0;
+    out.fog = g.fog.xy;
     return out;
 }
 
@@ -82,6 +86,7 @@ fn vs_popup(
     out.color = color;
     out.line_factor = 0.0;
     out.shadowed = 0.0;
+    out.fog = g.fog.xy;
     return out;
 }
 
@@ -105,6 +110,39 @@ fn vs_find(
     out.color = color;
     out.line_factor = 0.0;
     out.shadowed = 0.0;
+    out.fog = g.fog.xy;
+    return out;
+}
+
+const CLIPPED: vec4<f32> = vec4<f32>(0.0, 0.0, -1.0, 1.0);
+
+@vertex
+fn vs_world(
+    @location(0) position: vec3<f32>,
+    @location(1) normal: vec3<f32>,
+    @location(2) offset: vec3<f32>,
+    @location(3) scale: vec2<f32>,
+    @location(4) color: vec4<f32>,
+    @location(5) surface: u32,
+) -> VsOut {
+    let base = surface * 3u;
+    let right = g.surfaces[base].xyz;
+    let up = g.surfaces[base + 1u].xyz;
+    let face = g.surfaces[base + 2u].xyz;
+    let origin = vec3<f32>(g.surfaces[base].w, g.surfaces[base + 1u].w, g.surfaces[base + 2u].w);
+    let local = vec3<f32>(position.x * scale.x, position.y * scale.y, position.z) + offset;
+    var out: VsOut;
+    out.world = origin + right * local.x + up * local.y + face * local.z;
+    out.normal = right * normal.x + up * normal.y + face * normal.z;
+    out.color = color;
+    out.line_factor = 0.0;
+    out.shadowed = 1.0;
+    out.fog = g.room.xy;
+    if (dot(g.camera_pos.xyz - origin, face) <= 0.0) {
+        out.clip = CLIPPED;
+    } else {
+        out.clip = g.view_proj * vec4<f32>(out.world, 1.0);
+    }
     return out;
 }
 
@@ -218,7 +256,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     color += g.accent.rgb * rim * (0.28 + in.line_factor * 0.8);
 
     let dist = distance(in.world, g.camera_pos.xyz);
-    let haze = smoothstep(g.fog.x, g.fog.y, dist);
+    let haze = smoothstep(in.fog.x, in.fog.y, dist);
     color = mix(color, backdrop(in.clip), haze);
 
     return vec4<f32>(color, 1.0);
@@ -245,4 +283,42 @@ fn fs_hud(in: HudOut) -> @location(0) vec4<f32> {
 @fragment
 fn fs_hud_flat(in: HudOut) -> @location(0) vec4<f32> {
     return in.color;
+}
+
+const ROOM_AMBIENT: vec3<f32> = vec3<f32>(0.40, 0.43, 0.52);
+const ROOM_KEY: vec3<f32> = vec3<f32>(0.95, 0.93, 0.88);
+const PLATE_LIFT: vec3<f32> = vec3<f32>(0.004, 0.006, 0.011);
+
+fn room_light(n: vec3<f32>, world: vec3<f32>, key: f32, wrap: f32) -> vec3<f32> {
+    let lit = shadow_lit(world, key);
+    let hemi = mix(vec3<f32>(0.035, 0.045, 0.075), vec3<f32>(0.14, 0.18, 0.27), n.y * 0.5 + 0.5);
+    return hemi + ROOM_AMBIENT * wrap + ROOM_KEY * key * lit * 0.6;
+}
+
+@fragment
+fn fs_world(in: VsOut) -> @location(0) vec4<f32> {
+    let n = normalize(in.normal);
+    let view = normalize(g.camera_pos.xyz - in.world);
+    let key_dir = normalize(g.light_dir.xyz);
+    let raw = dot(n, key_dir);
+    let key = max(raw, 0.0);
+    let spec = ggx_specular(n, view, key_dir, 0.2) * key;
+    var color = in.color.rgb * room_light(n, in.world, key, raw * 0.5 + 0.5);
+    color += vec3<f32>(1.0, 0.98, 0.95) * spec * 1.1;
+    let dist = distance(in.world, g.camera_pos.xyz);
+    color = mix(color, backdrop(in.clip), smoothstep(in.fog.x, in.fog.y, dist));
+    return vec4<f32>(color, 1.0);
+}
+
+@fragment
+fn fs_world_plate(in: VsOut) -> @location(0) vec4<f32> {
+    let n = normalize(in.normal);
+    let key_dir = normalize(g.light_dir.xyz);
+    let raw = dot(n, key_dir);
+    let wrap = raw * 0.5 + 0.5;
+    let lit = shadow_lit(in.world, max(raw, 0.0));
+    var color = in.color.rgb * (0.70 + 0.30 * wrap * lit) + PLATE_LIFT * wrap;
+    let dist = distance(in.world, g.camera_pos.xyz);
+    color = mix(color, backdrop(in.clip), smoothstep(in.fog.x, in.fog.y, dist));
+    return vec4<f32>(color, in.color.a);
 }

@@ -4,8 +4,102 @@ use winit::event_loop::ActiveEventLoop;
 use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 
 use crate::App;
+use crate::hud::{Rect, Surface};
 use crate::overlay::Panel;
 use crate::tasks::Task;
+
+pub const HINT_LIFETIME: f32 = 3.0;
+pub const HINT_THICKNESS: f32 = 0.9;
+pub const HINT_LAYER: u8 = 6;
+pub const EDGE_COUNT: usize = 4;
+
+const HINT_HOLD: f32 = 2.0;
+const HINT_PEAK: f32 = 240.0;
+const HINT_STEP: u8 = 0xF0;
+const SUCCESS_COLOR: [u8; 3] = [126, 210, 160];
+const ERROR_COLOR: [u8; 3] = [232, 104, 104];
+const INFORMATION_COLOR: [u8; 3] = [102, 199, 245];
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Edge {
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
+impl Edge {
+    pub fn of(surface: Surface) -> Option<Edge> {
+        match surface {
+            Surface::Tree => Some(Edge::Left),
+            Surface::Problems => Some(Edge::Right),
+            Surface::Results => Some(Edge::Top),
+            Surface::Output => Some(Edge::Bottom),
+            Surface::Code | Surface::Tabs | Surface::Screen => None,
+        }
+    }
+
+    pub fn slot(self) -> usize {
+        match self {
+            Edge::Left => 0,
+            Edge::Right => 1,
+            Edge::Top => 2,
+            Edge::Bottom => 3,
+        }
+    }
+
+    pub fn band(self, width: f32, height: f32) -> Rect {
+        let thickness = HINT_THICKNESS.min(width * 0.5).min(height * 0.5).max(0.0);
+        match self {
+            Edge::Left => Rect::new(0.0, 0.0, thickness, height),
+            Edge::Right => Rect::new(width - thickness, 0.0, thickness, height),
+            Edge::Top => Rect::new(0.0, 0.0, width, thickness),
+            Edge::Bottom => Rect::new(0.0, height - thickness, width, thickness),
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Tone {
+    Success,
+    Error,
+    Information,
+}
+
+impl Tone {
+    pub fn color(self) -> [u8; 3] {
+        match self {
+            Tone::Success => SUCCESS_COLOR,
+            Tone::Error => ERROR_COLOR,
+            Tone::Information => INFORMATION_COLOR,
+        }
+    }
+}
+
+pub fn hint_alpha(age: f32) -> u8 {
+    if !(age >= 0.0) || age >= HINT_LIFETIME {
+        return 0;
+    }
+    let fade = if age <= HINT_HOLD {
+        1.0
+    } else {
+        (HINT_LIFETIME - age) / (HINT_LIFETIME - HINT_HOLD)
+    };
+    ((fade * HINT_PEAK) as u8) & HINT_STEP
+}
+
+pub fn surface_of_panel(panel: Panel) -> Option<Surface> {
+    match panel {
+        Panel::Problems => Some(Surface::Problems),
+        Panel::Search | Panel::References => Some(Surface::Results),
+        Panel::None
+        | Panel::QuickOpen
+        | Panel::DocumentSymbols
+        | Panel::WorkspaceSymbols
+        | Panel::Rename
+        | Panel::Commands => None,
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Command {
@@ -46,6 +140,11 @@ pub enum Command {
     ToggleLineNumbers,
     NextFont,
     Recenter,
+    FaceTree,
+    FaceProblems,
+    FaceOutput,
+    FaceResults,
+    FaceCode,
     Quit,
 }
 
@@ -57,6 +156,17 @@ impl Command {
             Command::Run => Some(Task::Run),
             Command::Test => Some(Task::Test),
             Command::Clippy => Some(Task::Clippy),
+            _ => None,
+        }
+    }
+
+    pub fn surface(self) -> Option<Surface> {
+        match self {
+            Command::FaceTree => Some(Surface::Tree),
+            Command::FaceProblems => Some(Surface::Problems),
+            Command::FaceOutput => Some(Surface::Output),
+            Command::FaceResults => Some(Surface::Results),
+            Command::FaceCode => Some(Surface::Code),
             _ => None,
         }
     }
@@ -97,7 +207,7 @@ impl Chord {
     }
 }
 
-static ALL: [Command; 37] = [
+static ALL: [Command; 42] = [
     Command::OpenProject,
     Command::QuickOpen,
     Command::DocumentSymbols,
@@ -134,6 +244,11 @@ static ALL: [Command; 37] = [
     Command::ToggleLineNumbers,
     Command::NextFont,
     Command::Recenter,
+    Command::FaceTree,
+    Command::FaceProblems,
+    Command::FaceOutput,
+    Command::FaceResults,
+    Command::FaceCode,
     Command::Quit,
 ];
 
@@ -180,6 +295,11 @@ pub fn label(command: Command) -> &'static str {
         Command::ToggleLineNumbers => "numeros de ligne",
         Command::NextFont => "fonte suivante",
         Command::Recenter => "recadrer la vue",
+        Command::FaceTree => "viser l arbre de fichiers",
+        Command::FaceProblems => "viser les problemes",
+        Command::FaceOutput => "viser le terminal",
+        Command::FaceResults => "viser les resultats",
+        Command::FaceCode => "revenir au code",
         Command::Quit => "quitter",
     }
 }
@@ -223,6 +343,11 @@ pub fn shortcut(command: Command) -> &'static str {
         Command::ToggleLineNumbers => "option+8",
         Command::NextFont => "option+5",
         Command::Recenter => "option+1",
+        Command::FaceTree => "option+gauche",
+        Command::FaceProblems => "option+droite",
+        Command::FaceOutput => "option+bas",
+        Command::FaceResults => "option+haut",
+        Command::FaceCode => "option+entree",
         Command::Quit => "cmd+q",
     }
 }
@@ -310,8 +435,18 @@ fn control_chord(key: &Key, physical: PhysicalKey, chord: Chord) -> Option<Comma
 }
 
 fn option_chord(key: &Key, physical: PhysicalKey, chord: Chord) -> Option<Command> {
-    if matches!(key.as_ref(), Key::Named(_)) {
-        return None;
+    if let Key::Named(named) = key.as_ref() {
+        if chord.shift {
+            return None;
+        }
+        return match named {
+            NamedKey::ArrowLeft => Some(Command::FaceTree),
+            NamedKey::ArrowRight => Some(Command::FaceProblems),
+            NamedKey::ArrowDown => Some(Command::FaceOutput),
+            NamedKey::ArrowUp => Some(Command::FaceResults),
+            NamedKey::Enter => Some(Command::FaceCode),
+            _ => None,
+        };
     }
     if let Some(digit) = digit_of(key, physical) {
         return match digit {
@@ -534,6 +669,10 @@ pub fn execute(app: &mut App, command: Command, event_loop: &ActiveEventLoop) {
         app.close_panel();
         return;
     }
+    if let Some(surface) = command.surface() {
+        app.aim_at(surface);
+        return;
+    }
     if let Some(task) = command.task() {
         app.run_task(task);
         return;
@@ -573,6 +712,11 @@ pub fn execute(app: &mut App, command: Command, event_loop: &ActiveEventLoop) {
         Command::Recenter => app.recenter(),
         Command::Quit => app.quit(event_loop),
         Command::Build | Command::Rebuild | Command::Run | Command::Test | Command::Clippy => {}
+        Command::FaceTree
+        | Command::FaceProblems
+        | Command::FaceOutput
+        | Command::FaceResults
+        | Command::FaceCode => {}
     }
 }
 
@@ -812,7 +956,7 @@ mod tests {
 
     #[test]
     fn la_table_est_complete_et_sans_doublon() {
-        assert_eq!(all().len(), 37);
+        assert_eq!(all().len(), 42);
         for (index, command) in all().iter().enumerate() {
             for other in all().iter().skip(index + 1) {
                 assert_ne!(command, other);
@@ -827,6 +971,125 @@ mod tests {
         assert!(Command::Problems.panel() == Some(Panel::Problems));
         assert!(Command::Rename.panel() == Some(Panel::Rename));
         assert!(Command::Save.panel().is_none());
+    }
+
+    #[test]
+    fn la_visee_des_surfaces_est_sur_option_fleche() {
+        let expected = [
+            (NamedKey::ArrowLeft, KeyCode::ArrowLeft, Command::FaceTree),
+            (NamedKey::ArrowRight, KeyCode::ArrowRight, Command::FaceProblems),
+            (NamedKey::ArrowDown, KeyCode::ArrowDown, Command::FaceOutput),
+            (NamedKey::ArrowUp, KeyCode::ArrowUp, Command::FaceResults),
+            (NamedKey::Enter, KeyCode::Enter, Command::FaceCode),
+        ];
+        for (named, code, command) in expected {
+            assert_eq!(resolve(&Key::Named(named), at(code), option()), Some(command));
+        }
+    }
+
+    #[test]
+    fn option_shift_fleche_reste_a_la_selection_par_mot() {
+        let option_shift = Chord { alt: true, shift: true, ..Chord::default() };
+        assert_eq!(
+            resolve(&Key::Named(NamedKey::ArrowLeft), at(KeyCode::ArrowLeft), option_shift),
+            None
+        );
+        let control_option = Chord { control: true, alt: true, ..Chord::default() };
+        assert_eq!(
+            resolve(&Key::Named(NamedKey::ArrowLeft), at(KeyCode::ArrowLeft), control_option),
+            Some(Command::JumpBack)
+        );
+    }
+
+    #[test]
+    fn chaque_visee_porte_sa_surface() {
+        assert_eq!(Command::FaceTree.surface(), Some(Surface::Tree));
+        assert_eq!(Command::FaceProblems.surface(), Some(Surface::Problems));
+        assert_eq!(Command::FaceOutput.surface(), Some(Surface::Output));
+        assert_eq!(Command::FaceResults.surface(), Some(Surface::Results));
+        assert_eq!(Command::FaceCode.surface(), Some(Surface::Code));
+        assert_eq!(Command::Recenter.surface(), None);
+        assert_eq!(Command::Build.surface(), None);
+    }
+
+    #[test]
+    fn les_panneaux_meubles_ont_une_surface() {
+        assert_eq!(surface_of_panel(Panel::Problems), Some(Surface::Problems));
+        assert_eq!(surface_of_panel(Panel::Search), Some(Surface::Results));
+        assert_eq!(surface_of_panel(Panel::References), Some(Surface::Results));
+        assert_eq!(surface_of_panel(Panel::QuickOpen), None);
+        assert_eq!(surface_of_panel(Panel::Commands), None);
+        assert_eq!(surface_of_panel(Panel::Rename), None);
+        assert_eq!(surface_of_panel(Panel::None), None);
+    }
+
+    #[test]
+    fn chaque_mur_a_son_bord_d_ecran() {
+        assert_eq!(Edge::of(Surface::Tree), Some(Edge::Left));
+        assert_eq!(Edge::of(Surface::Problems), Some(Edge::Right));
+        assert_eq!(Edge::of(Surface::Results), Some(Edge::Top));
+        assert_eq!(Edge::of(Surface::Output), Some(Edge::Bottom));
+        assert_eq!(Edge::of(Surface::Code), None);
+        assert_eq!(Edge::of(Surface::Tabs), None);
+        assert_eq!(Edge::of(Surface::Screen), None);
+        let mut seen = [false; EDGE_COUNT];
+        for edge in [Edge::Left, Edge::Right, Edge::Top, Edge::Bottom] {
+            let slot = edge.slot();
+            assert!(slot < EDGE_COUNT);
+            assert!(!seen[slot]);
+            seen[slot] = true;
+        }
+    }
+
+    #[test]
+    fn les_bandes_collent_au_bon_bord() {
+        let width = 100.0;
+        let height = 60.0;
+        let left = Edge::Left.band(width, height);
+        assert_eq!(left.x, 0.0);
+        assert_eq!(left.h, height);
+        assert!(left.w > 0.0 && left.w < width * 0.5);
+        let right = Edge::Right.band(width, height);
+        assert!((right.right() - width).abs() < 1.0e-4);
+        assert_eq!(right.h, height);
+        let top = Edge::Top.band(width, height);
+        assert_eq!(top.y, 0.0);
+        assert_eq!(top.w, width);
+        let bottom = Edge::Bottom.band(width, height);
+        assert!((bottom.bottom() - height).abs() < 1.0e-4);
+        assert_eq!(bottom.w, width);
+        let tiny = Edge::Left.band(0.2, 0.2);
+        assert!(tiny.w <= 0.1 + 1.0e-4);
+    }
+
+    #[test]
+    fn l_indice_peripherique_dure_trois_secondes() {
+        assert!(hint_alpha(0.0) > 200);
+        assert_eq!(hint_alpha(0.0), hint_alpha(1.5));
+        assert_eq!(hint_alpha(HINT_LIFETIME), 0);
+        assert_eq!(hint_alpha(HINT_LIFETIME + 1.0), 0);
+        assert_eq!(hint_alpha(-1.0), 0);
+        assert_eq!(hint_alpha(f32::NAN), 0);
+        let mut previous = hint_alpha(2.0);
+        let mut step = 1;
+        while step <= 10 {
+            let age = 2.0 + step as f32 * 0.1;
+            let current = hint_alpha(age);
+            assert!(current <= previous, "alpha remonte a {age}");
+            previous = current;
+            step += 1;
+        }
+        assert_eq!(previous, 0);
+    }
+
+    #[test]
+    fn les_couleurs_d_indice_sont_distinctes() {
+        assert_ne!(Tone::Success.color(), Tone::Error.color());
+        assert_ne!(Tone::Success.color(), Tone::Information.color());
+        assert_ne!(Tone::Error.color(), Tone::Information.color());
+        assert!(Tone::Success.color()[1] > Tone::Success.color()[0]);
+        assert!(Tone::Error.color()[0] > Tone::Error.color()[1]);
+        assert!(Tone::Information.color()[2] > Tone::Information.color()[0]);
     }
 
     #[test]
